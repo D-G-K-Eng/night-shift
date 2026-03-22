@@ -15,191 +15,234 @@
     overflow: hidden;
     font-family: monospace;
   }
-  canvas {
-    display: block;
-    image-rendering: pixelated;
-  }
+  canvas { display: block; image-rendering: pixelated; }
 </style>
 </head>
 <body>
 <canvas id="gameCanvas" width="800" height="600"></canvas>
-
 <script>
 'use strict';
 
 // ─── Audio Stubs (Hammerz implements these) ────────────────────────────────
 const Audio = {
   init() {},
-  setEngineSpeed(normalizedSpeed) {}, // 0-1
+  setEngineSpeed(normalizedSpeed) {},  // 0-1
   playPickup() {},
   playDropoff(earnings) {},
-  setCopSiren(wantedLevel) {},        // 0-3
+  setCopSiren(wantedLevel) {},         // 0-3
   startAmbience() {},
+  setParkState(parked) {},             // called when entering/exiting park state
+  setCopProximity(distance) {},        // called each frame with nearest cop distance (999 if no cops)
 };
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 const CANVAS_W = 800;
 const CANVAS_H = 600;
 
-const TILE_SIZE = 32;             // pixels per tile
-const CITY_TILES = 40;            // 40×40 tile grid
-const CITY_SIZE = CITY_TILES * TILE_SIZE; // 1280px
+const TILE_SIZE  = 32;
+const CITY_TILES = 40;
+const CITY_SIZE  = CITY_TILES * TILE_SIZE; // 1280px
 
-// City layout: blocks of 4 building tiles + 2 road tiles, repeating every 6
-const BLOCK_SIZE = 4;             // building tiles per block
-const ROAD_WIDTH = 2;             // road tiles wide
-const PERIOD = BLOCK_SIZE + ROAD_WIDTH; // 6 tiles per period
+const BLOCK_SIZE = 4;
+const ROAD_WIDTH = 2;
+const PERIOD     = BLOCK_SIZE + ROAD_WIDTH; // 6 tiles per period
 
 // Tile types
-const TILE = { ROAD: 0, BUILDING: 1, SIDEWALK: 2 };
+const TILE = { ROAD: 0, BUILDING: 1, SIDEWALK: 2, HIDDEN_PARK: 3 };
 
 // Colors
 const COLOR = {
-  ROAD:      '#1a1a2e',
-  SIDEWALK:  '#2a2a3e',
-  ROAD_MARK: '#ffee00',
-  BG:        '#0a0a12',
+  ROAD:        '#1a1a2e',
+  SIDEWALK:    '#2a2a3e',
+  HIDDEN_PARK: '#0d0d1a',
+  ROAD_MARK:   '#ffee00',
+  BG:          '#0a0a12',
 };
-const BUILDING_COLORS = ['#0d0d1a', '#1a0d0d', '#0d1a0d', '#1a1a0d', '#0d0d22', '#22110d'];
-const NEON_COLORS     = ['#ff00aa', '#00ffee', '#aaff00', '#ff6600', '#ff0055'];
+const BUILDING_COLORS = ['#0d0d1a','#1a0d0d','#0d1a0d','#1a1a0d','#0d0d22','#22110d'];
+const NEON_COLORS     = ['#ff00aa','#00ffee','#aaff00','#ff6600','#ff0055'];
 
 // Car physics
-const CAR_W            = 16;
-const CAR_H            = 28;
-const MAX_SPEED        = 4.0;
-const ACCELERATION     = 0.15;
-const FRICTION         = 0.92;
-const TURN_RATE        = 3;       // degrees per frame
+const CAR_W        = 16;
+const CAR_H        = 28;
+const MAX_SPEED    = 4.0;
+const ACCELERATION = 0.15;
+const FRICTION     = 0.92;
+const TURN_RATE    = 3;        // degrees per frame
 
 // Game rules
-const PICKUP_RADIUS    = 20;
-const DROP_RADIUS      = 20;
-const COP_CATCH_RADIUS = 20;
-const MIN_DEST_DIST    = 200;
-const COP_SPEED        = 2.0;
-const MIN_EARNINGS     = 10;
-const DROPOFF_DIST_FACTOR = 0.5;
+const WORKER_PICKUP_RADIUS  = 20;
+const DROP_RADIUS           = 20;
+const COP_BUST_RADIUS       = 20;
+const COP_CHASE_RADIUS      = 80;   // cop switches to CHASE within this dist (worker in car)
+const COP_NEAR_PARK_RADIUS  = 120;  // edge-flash when parked and cop this close
+const PARK_SPEED_THRESHOLD  = 0.3;
+const PARK_TIMER_DURATION   = 5;    // seconds
+const COP_PATROL_SPEED      = 1.5;
+const COP_CHASE_SPEED       = 2.8;
+const PATROL_REACH          = 16;   // px to advance patrol index
+const DROPOFF_MIN_DIST      = 50;
+const DROPOFF_MAX_DIST      = 200;
+const MIN_EARNINGS          = 15;
+const MAX_EARNINGS          = 40;
+const COP_SPAWN_DIST        = 300;
+const INITIAL_COP_COUNT     = 2;
+const STAR_THRESHOLDS       = [3, 6, 10];
+const MAX_STARS             = 3;
 
-// Wanted thresholds
-const STAR_THRESHOLDS = [3, 6, 10];
-const MAX_STARS       = 3;
-const COP_SPAWN_DIST  = 300;
+// Game phases
+const PHASE = {
+  FIND_WORKER: 'FIND_WORKER',  // looking for worker on sidewalk
+  HAS_WORKER:  'HAS_WORKER',   // worker in car, find hidden park
+  PARKED:      'PARKED',       // at hidden park, timer running
+  DROPOFF:     'DROPOFF',      // drive to drop-off tile
+};
 
 // ─── State ─────────────────────────────────────────────────────────────────
 let canvas, ctx;
-let map;         // 2D array of tile types
-let blockColors; // color per city block
-let neonSigns;   // [{x,y,w,h,color}]
-let windows;     // [{x,y}] pre-baked window dots
+let map, blockColors, neonSigns, windows;
+let hiddenParks = [];  // [{tx, ty, wx, wy}]
 
-// Player exported at top level
-const Player = {
-  x: 0, y: 0,
-  vx: 0, vy: 0,
-  angle: 0,   // degrees, 0=up
-  speed: 0,
-};
+const Player = { x: 0, y: 0, vx: 0, vy: 0, angle: 0, speed: 0 };
 
-let clients      = [];   // {x, y} pickup waypoints
-let destination  = null; // {x, y} or null
-let pickupPos    = null; // position when fare was picked up
-let earnings     = 0;
-let dropoffs     = 0;
-let wantedLevel  = 0;
-let cops         = [];   // [{x,y,vx,vy}]
-let pulse        = 0;    // animation counter
+let workers    = [];   // [{x,y}] sidewalk waypoints
+let dropoffPos = null; // {x,y} road tile for drop-off
+let earnings   = 0;
+let dropoffs   = 0;
+let wantedLevel = 0;
+let cops       = [];   // full cop objects
+let pulse      = 0;
 
-// Input
+let gamePhase          = PHASE.FIND_WORKER;
+let workerInCar        = false;
+let isParked           = false;
+let parkTimerEnd       = 0;
+let parkTimerRemaining = 0;
+let dropoffEarnings    = 0;
+let nearCopWarningTimer = 0;
+let nearestCopDist     = 999;
+
 const keys = {};
-
-// Game state machine
 const STATE = { PLAYING: 'PLAYING', BUSTED: 'BUSTED' };
-let gameState = STATE.PLAYING;
-let bustFlash = 0; // frames of red flash remaining
+let gameState    = STATE.PLAYING;
+let bustFlash    = 0;
 let audioStarted = false;
 
-// ─── Map Generation ────────────────────────────────────────────────────────
-function isRoadCol(tileX) {
-  return (tileX % PERIOD) < ROAD_WIDTH;
-}
-function isRoadRow(tileY) {
-  return (tileY % PERIOD) < ROAD_WIDTH;
+// ─── Exports for audio engine ───────────────────────────────────────────────
+window.TILE    = TILE;
+window.getTile = function(worldX, worldY) {
+  const tx = Math.floor(worldX / TILE_SIZE);
+  const ty = Math.floor(worldY / TILE_SIZE);
+  if (tx < 0 || ty < 0 || tx >= CITY_TILES || ty >= CITY_TILES) return TILE.BUILDING;
+  return map[ty][tx];
+};
+
+window.CopPatrolRoutes    = [];  // [[{x,y},...], ...] one per cop
+window.NearestCopDistance = 999; // live px
+
+window.GameState = {
+  get parked()      { return isParked; },
+  get parkTimer()   { return parkTimerRemaining; },
+  get workerInCar() { return workerInCar; },
+};
+
+// ─── Tile Helpers ───────────────────────────────────────────────────────────
+function isRoadCol(tileX) { return (tileX % PERIOD) < ROAD_WIDTH; }
+function isRoadRow(tileY) { return (tileY % PERIOD) < ROAD_WIDTH; }
+
+function tilePassable(tx, ty) {
+  if (tx < 0 || ty < 0 || tx >= CITY_TILES || ty >= CITY_TILES) return false;
+  const t = map[ty][tx];
+  return t === TILE.ROAD || t === TILE.HIDDEN_PARK;
 }
 
+function isSidewalkTile(tx, ty) {
+  if (tx < 0 || ty < 0 || tx >= CITY_TILES || ty >= CITY_TILES) return false;
+  return map[ty][tx] === TILE.SIDEWALK;
+}
+
+// ─── Map Generation ────────────────────────────────────────────────────────
 function generateMap() {
   map = [];
   for (let y = 0; y < CITY_TILES; y++) {
     map[y] = [];
     for (let x = 0; x < CITY_TILES; x++) {
-      const roadX = isRoadCol(x);
-      const roadY = isRoadRow(y);
-      if (roadX || roadY) {
+      const rX = isRoadCol(x), rY = isRoadRow(y);
+      if (rX || rY) {
         map[y][x] = TILE.ROAD;
       } else {
-        // Check if adjacent to road (sidewalk)
-        const adjRoad = isRoadCol(x-1) || isRoadCol(x+1) || isRoadRow(y-1) || isRoadRow(y+1);
-        map[y][x] = adjRoad ? TILE.SIDEWALK : TILE.BUILDING;
+        const adj = isRoadCol(x-1) || isRoadCol(x+1) || isRoadRow(y-1) || isRoadRow(y+1);
+        map[y][x] = adj ? TILE.SIDEWALK : TILE.BUILDING;
       }
     }
   }
 
-  // Assign colors to each city block
+  // ── Hidden park tiles (non-intersection corridor tiles) ──────────────────
+  const corridors = [];
+  for (let y = 2; y < CITY_TILES - 2; y++) {
+    for (let x = 2; x < CITY_TILES - 2; x++) {
+      if (map[y][x] === TILE.ROAD && !(isRoadCol(x) && isRoadRow(y))) {
+        corridors.push({ x, y });
+      }
+    }
+  }
+  // Seeded shuffle, pick 7
+  const rngH = mulberry32(555);
+  for (let i = corridors.length - 1; i > 0; i--) {
+    const j = Math.floor(rngH() * (i + 1));
+    [corridors[i], corridors[j]] = [corridors[j], corridors[i]];
+  }
+  hiddenParks = [];
+  for (const t of corridors.slice(0, 7)) {
+    map[t.y][t.x] = TILE.HIDDEN_PARK;
+    hiddenParks.push({
+      tx: t.x, ty: t.y,
+      wx: t.x * TILE_SIZE + TILE_SIZE / 2,
+      wy: t.y * TILE_SIZE + TILE_SIZE / 2,
+    });
+  }
+
+  // ── Block colors ─────────────────────────────────────────────────────────
   blockColors = [];
   for (let by = 0; by < CITY_TILES; by++) {
     blockColors[by] = [];
     for (let bx = 0; bx < CITY_TILES; bx++) {
-      // Determine block index
-      const blockY = Math.floor(by / PERIOD);
-      const blockX = Math.floor(bx / PERIOD);
-      // Seed based on block index
-      const seed = blockY * 100 + blockX;
+      const seed = Math.floor(by / PERIOD) * 100 + Math.floor(bx / PERIOD);
       blockColors[by][bx] = BUILDING_COLORS[seed % BUILDING_COLORS.length];
     }
   }
 
-  // Pre-bake building windows
+  // ── Pre-bake windows ─────────────────────────────────────────────────────
   windows = [];
   const rng = mulberry32(42);
   for (let y = 0; y < CITY_TILES; y++) {
     for (let x = 0; x < CITY_TILES; x++) {
-      if (map[y][x] === TILE.BUILDING) {
-        // ~30% of windows lit, placed in a grid pattern within the tile
-        for (let wy = 4; wy < TILE_SIZE - 4; wy += 6) {
-          for (let wx = 4; wx < TILE_SIZE - 4; wx += 6) {
-            if (rng() < 0.30) {
-              windows.push({
-                px: x * TILE_SIZE + wx,
-                py: y * TILE_SIZE + wy,
-                bright: rng() > 0.5,
-              });
-            }
+      if (map[y][x] !== TILE.BUILDING) continue;
+      for (let wy = 4; wy < TILE_SIZE - 4; wy += 6) {
+        for (let wx = 4; wx < TILE_SIZE - 4; wx += 6) {
+          if (rng() < 0.30) {
+            windows.push({ px: x*TILE_SIZE+wx, py: y*TILE_SIZE+wy, bright: rng() > 0.5 });
           }
         }
       }
     }
   }
 
-  // Neon signs: 2-3 on random building faces
+  // ── Neon signs ───────────────────────────────────────────────────────────
   neonSigns = [];
   const rng2 = mulberry32(99);
-  const count = 2 + Math.floor(rng2() * 2);
-  for (let i = 0; i < count; i++) {
+  const cnt  = 2 + Math.floor(rng2() * 2);
+  for (let i = 0; i < cnt; i++) {
     let tx, ty;
-    do {
-      tx = Math.floor(rng2() * CITY_TILES);
-      ty = Math.floor(rng2() * CITY_TILES);
-    } while (map[ty][tx] !== TILE.BUILDING);
+    do { tx = Math.floor(rng2() * CITY_TILES); ty = Math.floor(rng2() * CITY_TILES); }
+    while (map[ty][tx] !== TILE.BUILDING);
     neonSigns.push({
-      px: tx * TILE_SIZE + 2,
-      py: ty * TILE_SIZE + 2,
-      w: TILE_SIZE - 4,
-      h: TILE_SIZE - 4,
+      px: tx*TILE_SIZE+2, py: ty*TILE_SIZE+2,
+      w: TILE_SIZE-4, h: TILE_SIZE-4,
       color: NEON_COLORS[Math.floor(rng2() * NEON_COLORS.length)],
     });
   }
 }
 
-// Simple deterministic RNG (mulberry32)
 function mulberry32(seed) {
   return function() {
     seed |= 0; seed = seed + 0x6D2B79F5 | 0;
@@ -209,36 +252,55 @@ function mulberry32(seed) {
   };
 }
 
-// ─── Road Tile Helpers ──────────────────────────────────────────────────────
-function isRoadTile(tileX, tileY) {
-  if (tileX < 0 || tileY < 0 || tileX >= CITY_TILES || tileY >= CITY_TILES) return false;
-  return map[tileY][tileX] === TILE.ROAD;
-}
-
+// ─── Position Helpers ────────────────────────────────────────────────────────
 function randomRoadPos() {
-  let tx, ty;
+  let tx, ty, tries = 0;
   do {
     tx = Math.floor(Math.random() * CITY_TILES);
     ty = Math.floor(Math.random() * CITY_TILES);
-  } while (!isRoadTile(tx, ty));
-  return {
-    x: tx * TILE_SIZE + TILE_SIZE / 2,
-    y: ty * TILE_SIZE + TILE_SIZE / 2,
-  };
+    tries++;
+  } while (!tilePassable(tx, ty) && tries < 500);
+  return { x: tx*TILE_SIZE + TILE_SIZE/2, y: ty*TILE_SIZE + TILE_SIZE/2 };
 }
 
 function randomRoadPosFarFrom(px, py, minDist) {
-  let pos, attempts = 0;
+  let pos, tries = 0;
+  do { pos = randomRoadPos(); tries++; }
+  while (dist(pos.x, pos.y, px, py) < minDist && tries < 200);
+  return pos;
+}
+
+function randomRoadPosBetween(px, py, minD, maxD) {
+  let pos, tries = 0;
   do {
     pos = randomRoadPos();
-    attempts++;
-  } while (dist(pos.x, pos.y, px, py) < minDist && attempts < 200);
+    const d = dist(pos.x, pos.y, px, py);
+    if (d >= minD && d <= maxD) return pos;
+    tries++;
+  } while (tries < 300);
+  return randomRoadPosFarFrom(px, py, minD);
+}
+
+function randomSidewalkPos() {
+  let tx, ty, tries = 0;
+  do {
+    tx = Math.floor(Math.random() * CITY_TILES);
+    ty = Math.floor(Math.random() * CITY_TILES);
+    tries++;
+  } while (!isSidewalkTile(tx, ty) && tries < 500);
+  return { x: tx*TILE_SIZE + TILE_SIZE/2, y: ty*TILE_SIZE + TILE_SIZE/2 };
+}
+
+function randomSidewalkPosFarFrom(px, py, minDist) {
+  let pos, tries = 0;
+  do { pos = randomSidewalkPos(); tries++; }
+  while (dist(pos.x, pos.y, px, py) < minDist && tries < 200);
   return pos;
 }
 
 // ─── Math Helpers ───────────────────────────────────────────────────────────
 function dist(ax, ay, bx, by) {
-  const dx = bx - ax, dy = by - ay;
+  const dx = bx-ax, dy = by-ay;
   return Math.sqrt(dx*dx + dy*dy);
 }
 function degToRad(d) { return d * Math.PI / 180; }
@@ -246,86 +308,102 @@ function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 // ─── Collision ──────────────────────────────────────────────────────────────
 function isBuildingAt(wx, wy) {
-  const tx = Math.floor(wx / TILE_SIZE);
-  const ty = Math.floor(wy / TILE_SIZE);
+  const tx = Math.floor(wx / TILE_SIZE), ty = Math.floor(wy / TILE_SIZE);
   if (tx < 0 || ty < 0 || tx >= CITY_TILES || ty >= CITY_TILES) return true;
   return map[ty][tx] === TILE.BUILDING;
 }
-
-// AABB collision check for car corners
 function carOverlapsBuilding(cx, cy) {
-  const hw = CAR_W / 2, hh = CAR_H / 2;
-  // Sample corners (unrotated — approximate for simplicity)
-  const corners = [
-    [cx - hw, cy - hh],
-    [cx + hw, cy - hh],
-    [cx - hw, cy + hh],
-    [cx + hw, cy + hh],
-  ];
-  return corners.some(([x, y]) => isBuildingAt(x, y));
+  const hw = CAR_W/2, hh = CAR_H/2;
+  return [[cx-hw,cy-hh],[cx+hw,cy-hh],[cx-hw,cy+hh],[cx+hw,cy+hh]]
+    .some(([x,y]) => isBuildingAt(x,y));
+}
+
+// ─── Cop Patrol Generation ───────────────────────────────────────────────────
+function generatePatrolRoute(startX, startY, n) {
+  const route = [];
+  let cx = startX, cy = startY;
+  for (let i = 0; i < n; i++) {
+    const p = randomRoadPosFarFrom(cx, cy, 100);
+    route.push({ x: p.x, y: p.y });
+    cx = p.x; cy = p.y;
+  }
+  return route;
 }
 
 // ─── Cop Spawning ───────────────────────────────────────────────────────────
 function spawnCops(targetCount) {
   while (cops.length < targetCount) {
-    const pos = randomRoadPosFarFrom(Player.x, Player.y, COP_SPAWN_DIST);
-    cops.push({ x: pos.x, y: pos.y, vx: 0, vy: 0 });
+    const pos    = randomRoadPosFarFrom(Player.x, Player.y, COP_SPAWN_DIST);
+    const nPts   = 3 + Math.floor(Math.random() * 3);
+    const patrol = generatePatrolRoute(pos.x, pos.y, nPts);
+    cops.push({
+      x: pos.x, y: pos.y,
+      vx: 0, vy: 0,
+      angle: 0,
+      patrolPoints: patrol,
+      patrolIndex:  0,
+      mode: 'PATROL',
+    });
   }
-  // Remove excess cops if wanted dropped (not used currently, but defensive)
   while (cops.length > targetCount) cops.pop();
+  window.CopPatrolRoutes = cops.map(c => c.patrolPoints.slice());
 }
 
 function updateWanted() {
-  let newLevel = 0;
+  let lvl = 0;
   for (let i = 0; i < STAR_THRESHOLDS.length; i++) {
-    if (dropoffs >= STAR_THRESHOLDS[i]) newLevel = i + 1;
+    if (dropoffs >= STAR_THRESHOLDS[i]) lvl = i + 1;
   }
-  if (newLevel !== wantedLevel) {
-    wantedLevel = newLevel;
+  if (lvl !== wantedLevel) {
+    wantedLevel = lvl;
     Audio.setCopSiren(wantedLevel);
-    spawnCops(wantedLevel);
+    spawnCops(INITIAL_COP_COUNT + wantedLevel);
   }
 }
 
-// ─── Game Init & Reset ──────────────────────────────────────────────────────
+// ─── Game Init ───────────────────────────────────────────────────────────────
 function initGame() {
   generateMap();
 
-  // Place player on a road tile near center
-  const startPos = randomRoadPos();
-  Player.x = startPos.x;
-  Player.y = startPos.y;
-  Player.vx = 0;
-  Player.vy = 0;
-  Player.angle = 0;
-  Player.speed = 0;
+  const sp   = randomRoadPos();
+  Player.x   = sp.x; Player.y = sp.y;
+  Player.vx  = 0;    Player.vy = 0;
+  Player.angle = 0;  Player.speed = 0;
 
-  clients = [];
-  for (let i = 0; i < 3; i++) {
-    clients.push(randomRoadPosFarFrom(Player.x, Player.y, 80));
+  workers   = [];
+  for (let i = 0; i < 2; i++) {
+    workers.push(randomSidewalkPosFarFrom(Player.x, Player.y, 80));
   }
-  destination = null;
-  pickupPos = null;
-  earnings = 0;
-  dropoffs = 0;
-  wantedLevel = 0;
-  cops = [];
-  pulse = 0;
-  gameState = STATE.PLAYING;
-  bustFlash = 0;
+
+  dropoffPos          = null;
+  earnings            = 0;
+  dropoffs            = 0;
+  wantedLevel         = 0;
+  cops                = [];
+  pulse               = 0;
+  gameState           = STATE.PLAYING;
+  bustFlash           = 0;
+  gamePhase           = PHASE.FIND_WORKER;
+  workerInCar         = false;
+  isParked            = false;
+  parkTimerEnd        = 0;
+  parkTimerRemaining  = 0;
+  dropoffEarnings     = 0;
+  nearCopWarningTimer = 0;
+  nearestCopDist      = 999;
+
+  window.NearestCopDistance = 999;
+  spawnCops(INITIAL_COP_COUNT);
 }
 
 // ─── Update ─────────────────────────────────────────────────────────────────
 function update() {
   if (gameState === STATE.BUSTED) {
     if (bustFlash > 0) bustFlash--;
-    if (keys[' '] || keys['Space']) {
-      initGame();
-    }
+    if (keys[' '] || keys['Space']) initGame();
     return;
   }
 
-  // Audio init on first key press
   if (!audioStarted && Object.keys(keys).some(k => keys[k])) {
     Audio.init();
     Audio.startAmbience();
@@ -336,125 +414,148 @@ function update() {
 
   // ── Steering ──────────────────────────────────────────────────────────────
   const moving = Math.abs(Player.speed) > 0.1;
-  if (moving) {
-    if (keys['ArrowLeft'] || keys['a'] || keys['A']) {
-      Player.angle -= TURN_RATE * (Player.speed / MAX_SPEED);
-    }
-    if (keys['ArrowRight'] || keys['d'] || keys['D']) {
-      Player.angle += TURN_RATE * (Player.speed / MAX_SPEED);
-    }
+  if (moving && gamePhase !== PHASE.PARKED) {
+    if (keys['ArrowLeft']  || keys['a'] || keys['A']) Player.angle -= TURN_RATE * (Player.speed / MAX_SPEED);
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) Player.angle += TURN_RATE * (Player.speed / MAX_SPEED);
   }
 
   // ── Throttle ──────────────────────────────────────────────────────────────
-  const angleRad = degToRad(Player.angle);
-  const fwdX = Math.sin(angleRad);
-  const fwdY = -Math.cos(angleRad);
-
-  if (keys['ArrowUp'] || keys['w'] || keys['W']) {
-    Player.vx += fwdX * ACCELERATION;
-    Player.vy += fwdY * ACCELERATION;
-  }
-  if (keys['ArrowDown'] || keys['s'] || keys['S']) {
-    Player.vx -= fwdX * ACCELERATION * 0.6;
-    Player.vy -= fwdY * ACCELERATION * 0.6;
+  if (gamePhase !== PHASE.PARKED) {
+    const rad  = degToRad(Player.angle);
+    const fwdX = Math.sin(rad), fwdY = -Math.cos(rad);
+    if (keys['ArrowUp']   || keys['w'] || keys['W']) { Player.vx += fwdX * ACCELERATION;       Player.vy += fwdY * ACCELERATION; }
+    if (keys['ArrowDown'] || keys['s'] || keys['S']) { Player.vx -= fwdX * ACCELERATION * 0.6; Player.vy -= fwdY * ACCELERATION * 0.6; }
   }
 
-  // ── Friction ──────────────────────────────────────────────────────────────
+  // ── Friction & speed cap ──────────────────────────────────────────────────
   Player.vx *= FRICTION;
   Player.vy *= FRICTION;
-
-  // Clamp speed
-  const spd = Math.sqrt(Player.vx * Player.vx + Player.vy * Player.vy);
-  if (spd > MAX_SPEED) {
-    Player.vx = (Player.vx / spd) * MAX_SPEED;
-    Player.vy = (Player.vy / spd) * MAX_SPEED;
-  }
+  const spd = Math.sqrt(Player.vx*Player.vx + Player.vy*Player.vy);
+  if (spd > MAX_SPEED) { Player.vx = (Player.vx/spd)*MAX_SPEED; Player.vy = (Player.vy/spd)*MAX_SPEED; }
   Player.speed = spd;
 
-  // ── Collision & movement ──────────────────────────────────────────────────
-  const newX = Player.x + Player.vx;
-  const newY = Player.y + Player.vy;
-
-  // Try full move
-  if (!carOverlapsBuilding(newX, newY)) {
-    Player.x = newX;
-    Player.y = newY;
-  } else {
-    // Try slide X only
-    if (!carOverlapsBuilding(newX, Player.y)) {
-      Player.x = newX;
-      Player.vy = 0;
-    }
-    // Try slide Y only
-    else if (!carOverlapsBuilding(Player.x, newY)) {
-      Player.y = newY;
-      Player.vx = 0;
-    } else {
-      // Full stop
-      Player.vx = 0;
-      Player.vy = 0;
-    }
-  }
-
-  // Clamp to world bounds
-  Player.x = clamp(Player.x, CAR_W / 2, CITY_SIZE - CAR_W / 2);
-  Player.y = clamp(Player.y, CAR_H / 2, CITY_SIZE - CAR_H / 2);
+  // ── Move & collide ────────────────────────────────────────────────────────
+  const nx = Player.x + Player.vx, ny = Player.y + Player.vy;
+  if      (!carOverlapsBuilding(nx, ny))       { Player.x = nx; Player.y = ny; }
+  else if (!carOverlapsBuilding(nx, Player.y)) { Player.x = nx; Player.vy = 0; }
+  else if (!carOverlapsBuilding(Player.x, ny)) { Player.y = ny; Player.vx = 0; }
+  else                                          { Player.vx = 0; Player.vy = 0; }
+  Player.x = clamp(Player.x, CAR_W/2, CITY_SIZE - CAR_W/2);
+  Player.y = clamp(Player.y, CAR_H/2, CITY_SIZE - CAR_H/2);
 
   Audio.setEngineSpeed(Player.speed / MAX_SPEED);
 
-  // ── Pickup check ──────────────────────────────────────────────────────────
-  if (!destination) {
-    for (let i = clients.length - 1; i >= 0; i--) {
-      if (dist(Player.x, Player.y, clients[i].x, clients[i].y) < PICKUP_RADIUS) {
-        pickupPos = { x: Player.x, y: Player.y };
-        clients.splice(i, 1);
-        destination = randomRoadPosFarFrom(Player.x, Player.y, MIN_DEST_DIST);
+  // ── Phase logic ───────────────────────────────────────────────────────────
+  if (gamePhase === PHASE.FIND_WORKER) {
+    for (let i = workers.length - 1; i >= 0; i--) {
+      if (dist(Player.x, Player.y, workers[i].x, workers[i].y) < WORKER_PICKUP_RADIUS) {
+        workers.splice(i, 1);
+        workerInCar = true;
+        gamePhase   = PHASE.HAS_WORKER;
         Audio.playPickup();
         break;
       }
     }
-  }
 
-  // ── Dropoff check ─────────────────────────────────────────────────────────
-  if (destination) {
-    if (dist(Player.x, Player.y, destination.x, destination.y) < DROP_RADIUS) {
-      const traveled = pickupPos ? dist(pickupPos.x, pickupPos.y, Player.x, Player.y) : 0;
-      const fare = Math.max(MIN_EARNINGS, Math.round(traveled * DROPOFF_DIST_FACTOR));
-      earnings += fare;
+  } else if (gamePhase === PHASE.HAS_WORKER) {
+    const ptx = Math.floor(Player.x / TILE_SIZE);
+    const pty = Math.floor(Player.y / TILE_SIZE);
+    const onHiddenPark = map[pty] && map[pty][ptx] === TILE.HIDDEN_PARK;
+    if (onHiddenPark && Player.speed < PARK_SPEED_THRESHOLD) {
+      // Enter park state
+      gamePhase          = PHASE.PARKED;
+      isParked           = true;
+      parkTimerEnd       = Date.now() + PARK_TIMER_DURATION * 1000;
+      parkTimerRemaining = PARK_TIMER_DURATION;
+      Player.vx = 0; Player.vy = 0;
+      Audio.setParkState(true);
+      // Hidden spot — cops go blind
+      for (const c of cops) c.mode = 'PATROL';
+    }
+
+  } else if (gamePhase === PHASE.PARKED) {
+    const now = Date.now();
+    parkTimerRemaining = Math.max(0, (parkTimerEnd - now) / 1000);
+    if (parkTimerRemaining <= 0) {
+      isParked    = false;
+      workerInCar = false;
+      gamePhase   = PHASE.DROPOFF;
+      Audio.setParkState(false);
+      dropoffEarnings = MIN_EARNINGS + Math.floor(Math.random() * (MAX_EARNINGS - MIN_EARNINGS + 1));
+      dropoffPos  = randomRoadPosBetween(Player.x, Player.y, DROPOFF_MIN_DIST, DROPOFF_MAX_DIST);
+    }
+
+  } else if (gamePhase === PHASE.DROPOFF) {
+    if (dropoffPos && dist(Player.x, Player.y, dropoffPos.x, dropoffPos.y) < DROP_RADIUS) {
+      earnings  += dropoffEarnings;
       dropoffs++;
-      Audio.playDropoff(fare);
-      destination = null;
-      pickupPos = null;
-      // Spawn a new client
-      clients.push(randomRoadPosFarFrom(Player.x, Player.y, 80));
+      Audio.playDropoff(dropoffEarnings);
+      dropoffPos = null;
+      gamePhase  = PHASE.FIND_WORKER;
+      workers.push(randomSidewalkPosFarFrom(Player.x, Player.y, 80));
       updateWanted();
     }
   }
 
   // ── Cop AI ────────────────────────────────────────────────────────────────
+  nearestCopDist = 999;
+
   for (const cop of cops) {
-    const dx = Player.x - cop.x;
-    const dy = Player.y - cop.y;
-    const d = Math.sqrt(dx * dx + dy * dy);
-    if (d > 0) {
-      cop.vx = (dx / d) * COP_SPEED;
-      cop.vy = (dy / d) * COP_SPEED;
+    const pd = dist(cop.x, cop.y, Player.x, Player.y);
+    if (pd < nearestCopDist) nearestCopDist = pd;
+
+    // Mode switching — cops blind inside hidden park
+    if (!isParked) {
+      if (workerInCar && pd < COP_CHASE_RADIUS) {
+        cop.mode = 'CHASE';
+      } else if (cop.mode === 'CHASE' && pd > COP_CHASE_RADIUS * 2) {
+        cop.mode = 'PATROL'; // lost sight
+      }
+    }
+
+    if (cop.mode === 'PATROL') {
+      const tgt = cop.patrolPoints[cop.patrolIndex];
+      const dx  = tgt.x - cop.x, dy = tgt.y - cop.y;
+      const d   = Math.sqrt(dx*dx + dy*dy);
+      if (d < PATROL_REACH) {
+        cop.patrolIndex = (cop.patrolIndex + 1) % cop.patrolPoints.length;
+      } else {
+        cop.vx    = (dx/d) * COP_PATROL_SPEED;
+        cop.vy    = (dy/d) * COP_PATROL_SPEED;
+        cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+      }
+    } else {
+      // CHASE
+      const dx = Player.x - cop.x, dy = Player.y - cop.y;
+      const d  = Math.sqrt(dx*dx + dy*dy);
+      if (d > 0) {
+        cop.vx    = (dx/d) * COP_CHASE_SPEED;
+        cop.vy    = (dy/d) * COP_CHASE_SPEED;
+        cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+      }
     }
     cop.x += cop.vx;
     cop.y += cop.vy;
 
-    // Busted!
-    if (dist(cop.x, cop.y, Player.x, Player.y) < COP_CATCH_RADIUS) {
+    // BUST: cop reaches player while worker is in car AND not in hidden park
+    if (workerInCar && !isParked && pd < COP_BUST_RADIUS) {
       gameState = STATE.BUSTED;
       bustFlash = 30;
       Audio.setCopSiren(0);
+      Audio.setParkState(false);
       return;
     }
   }
+
+  window.NearestCopDistance = nearestCopDist;
+  Audio.setCopProximity(nearestCopDist);
+
+  // Near-cop warning while parked (visual stress, no bust)
+  if (isParked && nearestCopDist < COP_NEAR_PARK_RADIUS) nearCopWarningTimer = 30;
+  if (nearCopWarningTimer > 0) nearCopWarningTimer--;
 }
 
 // ─── Rendering ──────────────────────────────────────────────────────────────
-// Camera: player stays centered
 function getCameraOffset() {
   return {
     ox: Math.round(Player.x - CANVAS_W / 2),
@@ -463,56 +564,71 @@ function getCameraOffset() {
 }
 
 function drawMap(ox, oy) {
-  // Determine visible tile range
   const startTX = Math.max(0, Math.floor(ox / TILE_SIZE));
   const startTY = Math.max(0, Math.floor(oy / TILE_SIZE));
-  const endTX   = Math.min(CITY_TILES - 1, Math.ceil((ox + CANVAS_W) / TILE_SIZE));
-  const endTY   = Math.min(CITY_TILES - 1, Math.ceil((oy + CANVAS_H) / TILE_SIZE));
+  const endTX   = Math.min(CITY_TILES-1, Math.ceil((ox+CANVAS_W) / TILE_SIZE));
+  const endTY   = Math.min(CITY_TILES-1, Math.ceil((oy+CANVAS_H) / TILE_SIZE));
 
   for (let ty = startTY; ty <= endTY; ty++) {
     for (let tx = startTX; tx <= endTX; tx++) {
-      const sx = tx * TILE_SIZE - ox;
-      const sy = ty * TILE_SIZE - oy;
+      const sx = tx*TILE_SIZE - ox, sy = ty*TILE_SIZE - oy;
       const t  = map[ty][tx];
 
-      if (t === TILE.ROAD) {
+      if (t === TILE.HIDDEN_PARK) {
+        ctx.fillStyle = COLOR.HIDDEN_PARK;
+        ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
+        // Faint purple glow border
+        ctx.save();
+        ctx.shadowColor = '#4400aa';
+        ctx.shadowBlur  = 8;
+        ctx.strokeStyle = 'rgba(80,0,180,0.25)';
+        ctx.lineWidth   = 1;
+        ctx.strokeRect(sx+0.5, sy+0.5, TILE_SIZE-1, TILE_SIZE-1);
+        ctx.restore();
+        // Subtle discovery marker
+        ctx.save();
+        ctx.globalAlpha  = 0.2;
+        ctx.fillStyle    = '#8844cc';
+        ctx.font         = '8px monospace';
+        ctx.textAlign    = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('▮', sx + TILE_SIZE/2, sy + TILE_SIZE/2);
+        ctx.textBaseline = 'alphabetic';
+        ctx.globalAlpha  = 1;
+        ctx.restore();
+      } else if (t === TILE.ROAD) {
         ctx.fillStyle = COLOR.ROAD;
         ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
       } else if (t === TILE.SIDEWALK) {
         ctx.fillStyle = COLOR.SIDEWALK;
         ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
       } else {
-        // BUILDING — use block color
         ctx.fillStyle = blockColors[ty][tx];
         ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
       }
     }
   }
 
-  // Road center line markings
+  // Road dashes (also on HIDDEN_PARK for visual continuity)
   ctx.strokeStyle = COLOR.ROAD_MARK;
-  ctx.lineWidth = 1;
+  ctx.lineWidth   = 1;
   ctx.setLineDash([6, 10]);
+
+  const roadLike = (r, c) =>
+    r >= 0 && r < CITY_TILES && c >= 0 && c < CITY_TILES &&
+    (map[r][c] === TILE.ROAD || map[r][c] === TILE.HIDDEN_PARK);
+
   for (let ty = startTY; ty <= endTY; ty++) {
     for (let tx = startTX; tx <= endTX; tx++) {
-      if (map[ty][tx] !== TILE.ROAD) continue;
-      const sx = tx * TILE_SIZE - ox;
-      const sy = ty * TILE_SIZE - oy;
-      // Draw dashes on road center (only where road extends straight)
-      const roadH = ty > 0 && map[ty-1][tx] === TILE.ROAD && ty < CITY_TILES-1 && map[ty+1][tx] === TILE.ROAD;
-      const roadV = tx > 0 && map[ty][tx-1] === TILE.ROAD && tx < CITY_TILES-1 && map[ty][tx+1] === TILE.ROAD;
-      if (roadH && !roadV) {
-        // Vertical road — draw vertical dash in center
-        ctx.beginPath();
-        ctx.moveTo(sx + TILE_SIZE / 2, sy);
-        ctx.lineTo(sx + TILE_SIZE / 2, sy + TILE_SIZE);
-        ctx.stroke();
-      } else if (roadV && !roadH) {
-        // Horizontal road
-        ctx.beginPath();
-        ctx.moveTo(sx, sy + TILE_SIZE / 2);
-        ctx.lineTo(sx + TILE_SIZE, sy + TILE_SIZE / 2);
-        ctx.stroke();
+      const t = map[ty][tx];
+      if (t !== TILE.ROAD && t !== TILE.HIDDEN_PARK) continue;
+      const sx = tx*TILE_SIZE - ox, sy = ty*TILE_SIZE - oy;
+      const h  = roadLike(ty-1, tx) && roadLike(ty+1, tx);
+      const v  = roadLike(ty, tx-1) && roadLike(ty, tx+1);
+      if (h && !v) {
+        ctx.beginPath(); ctx.moveTo(sx+TILE_SIZE/2, sy); ctx.lineTo(sx+TILE_SIZE/2, sy+TILE_SIZE); ctx.stroke();
+      } else if (v && !h) {
+        ctx.beginPath(); ctx.moveTo(sx, sy+TILE_SIZE/2); ctx.lineTo(sx+TILE_SIZE, sy+TILE_SIZE/2); ctx.stroke();
       }
     }
   }
@@ -520,75 +636,69 @@ function drawMap(ox, oy) {
 }
 
 function drawWindows(ox, oy) {
-  // Visible world bounds
-  const wx1 = ox, wy1 = oy, wx2 = ox + CANVAS_W, wy2 = oy + CANVAS_H;
   for (const w of windows) {
-    if (w.px < wx1 || w.px > wx2 || w.py < wy1 || w.py > wy2) continue;
+    if (w.px < ox || w.px > ox+CANVAS_W || w.py < oy || w.py > oy+CANVAS_H) continue;
     ctx.fillStyle = w.bright ? '#ffffcc' : '#ffee88';
-    ctx.fillRect(w.px - ox, w.py - oy, 2, 2);
+    ctx.fillRect(w.px-ox, w.py-oy, 2, 2);
   }
 }
 
 function drawNeonSigns(ox, oy) {
   for (const n of neonSigns) {
-    const sx = n.px - ox, sy = n.py - oy;
-    if (sx + n.w < 0 || sx > CANVAS_W || sy + n.h < 0 || sy > CANVAS_H) continue;
+    const sx = n.px-ox, sy = n.py-oy;
+    if (sx+n.w < 0 || sx > CANVAS_W || sy+n.h < 0 || sy > CANVAS_H) continue;
     ctx.save();
-    ctx.shadowColor = n.color;
-    ctx.shadowBlur = 12;
-    ctx.fillStyle = n.color + '55';
-    ctx.fillRect(sx, sy, n.w, n.h);
-    ctx.strokeStyle = n.color;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(sx, sy, n.w, n.h);
+    ctx.shadowColor = n.color; ctx.shadowBlur = 12;
+    ctx.fillStyle   = n.color + '55'; ctx.fillRect(sx, sy, n.w, n.h);
+    ctx.strokeStyle = n.color; ctx.lineWidth = 2; ctx.strokeRect(sx, sy, n.w, n.h);
     ctx.restore();
   }
 }
 
 function drawWaypoints(ox, oy) {
   const p = 0.6 + 0.4 * Math.sin(pulse);
-  const r = 10 + 4 * Math.sin(pulse);
+  const r = 10  + 4   * Math.sin(pulse);
 
-  // Client waypoints
-  for (const c of clients) {
-    const sx = c.x - ox, sy = c.y - oy;
-    if (sx < -60 || sx > CANVAS_W + 60 || sy < -60 || sy > CANVAS_H + 60) continue;
+  // Worker waypoints (sidewalk curb)
+  for (const w of workers) {
+    const sx = w.x - ox, sy = w.y - oy;
+    if (sx < -60 || sx > CANVAS_W+60 || sy < -60 || sy > CANVAS_H+60) continue;
     ctx.save();
     ctx.globalAlpha = p;
-    ctx.shadowColor = '#00ff55';
-    ctx.shadowBlur = 20;
-    ctx.strokeStyle = '#00ff55';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(sx, sy, r, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.shadowColor = '#00ff55'; ctx.shadowBlur = 20;
+    ctx.strokeStyle = '#00ff55'; ctx.lineWidth  = 2;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.stroke();
     ctx.globalAlpha = 1;
     ctx.restore();
+    // Person icon
+    ctx.save();
     ctx.fillStyle = '#00ff88';
-    ctx.font = '9px monospace';
+    ctx.font      = '14px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('FARE', sx, sy - r - 4);
+    ctx.textBaseline = 'middle';
+    ctx.fillText('◉', sx, sy);
+    ctx.textBaseline = 'alphabetic';
+    ctx.font    = '8px monospace';
+    ctx.fillStyle = '#00ff55';
+    ctx.fillText('WORKER', sx, sy - r - 4);
+    ctx.restore();
   }
 
-  // Destination waypoint
-  if (destination) {
-    const sx = destination.x - ox, sy = destination.y - oy;
-    if (sx >= -60 && sx <= CANVAS_W + 60 && sy >= -60 && sy <= CANVAS_H + 60) {
+  // Drop-off waypoint (after parking transaction)
+  if (gamePhase === PHASE.DROPOFF && dropoffPos) {
+    const sx = dropoffPos.x - ox, sy = dropoffPos.y - oy;
+    if (sx >= -60 && sx <= CANVAS_W+60 && sy >= -60 && sy <= CANVAS_H+60) {
       ctx.save();
       ctx.globalAlpha = p;
-      ctx.shadowColor = '#ffee00';
-      ctx.shadowBlur = 20;
-      ctx.strokeStyle = '#ffee00';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(sx, sy, r, 0, Math.PI * 2);
-      ctx.stroke();
+      ctx.shadowColor = '#ffee00'; ctx.shadowBlur = 20;
+      ctx.strokeStyle = '#ffee00'; ctx.lineWidth  = 2;
+      ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.stroke();
       ctx.globalAlpha = 1;
       ctx.restore();
       ctx.fillStyle = '#ffee55';
-      ctx.font = '9px monospace';
+      ctx.font      = '9px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('DEST', sx, sy - r - 4);
+      ctx.fillText('DROP-OFF', sx, sy - r - 4);
     }
   }
 }
@@ -599,165 +709,194 @@ function drawCar(cx, cy, angle, isPlayer) {
   ctx.rotate(degToRad(angle));
 
   if (isPlayer) {
-    // White body
     ctx.fillStyle = '#dddddd';
-    ctx.fillRect(-CAR_W / 2, -CAR_H / 2, CAR_W, CAR_H);
-
-    // Yellow headlights (front)
+    ctx.fillRect(-CAR_W/2, -CAR_H/2, CAR_W, CAR_H);
     ctx.fillStyle = '#ffee55';
-    ctx.fillRect(-CAR_W / 2 + 2, -CAR_H / 2, 4, 3);
-    ctx.fillRect(CAR_W / 2 - 6, -CAR_H / 2, 4, 3);
-
-    // Red taillights (back)
+    ctx.fillRect(-CAR_W/2+2, -CAR_H/2, 4, 3);
+    ctx.fillRect(CAR_W/2-6,  -CAR_H/2, 4, 3);
     ctx.fillStyle = '#ff2200';
-    ctx.fillRect(-CAR_W / 2 + 2, CAR_H / 2 - 3, 4, 3);
-    ctx.fillRect(CAR_W / 2 - 6, CAR_H / 2 - 3, 4, 3);
-
-    // Windshield
+    ctx.fillRect(-CAR_W/2+2, CAR_H/2-3, 4, 3);
+    ctx.fillRect(CAR_W/2-6,  CAR_H/2-3, 4, 3);
     ctx.fillStyle = '#334455';
-    ctx.fillRect(-CAR_W / 2 + 3, -CAR_H / 2 + 4, CAR_W - 6, 6);
+    ctx.fillRect(-CAR_W/2+3, -CAR_H/2+4, CAR_W-6, 6);
   } else {
-    // Cop car — blue/white
     ctx.save();
-    ctx.shadowColor = '#0088ff';
-    ctx.shadowBlur = 12;
-    ctx.fillStyle = '#aaccff';
-    ctx.fillRect(-CAR_W / 2, -CAR_H / 2, CAR_W, CAR_H);
+    ctx.shadowColor = '#0088ff'; ctx.shadowBlur = 12;
+    ctx.fillStyle   = '#aaccff';
+    ctx.fillRect(-CAR_W/2, -CAR_H/2, CAR_W, CAR_H);
     ctx.restore();
-
-    // Blue stripes
     ctx.fillStyle = '#0044cc';
-    ctx.fillRect(-CAR_W / 2 + 3, -CAR_H / 2 + 4, CAR_W - 6, 5);
-    ctx.fillRect(-CAR_W / 2 + 3, CAR_H / 2 - 9, CAR_W - 6, 5);
-
-    // Siren (flashing based on pulse)
-    ctx.fillStyle = Math.sin(pulse * 3) > 0 ? '#ff0000' : '#0000ff';
-    ctx.fillRect(-4, -CAR_H / 2 - 3, 8, 3);
+    ctx.fillRect(-CAR_W/2+3, -CAR_H/2+4, CAR_W-6, 5);
+    ctx.fillRect(-CAR_W/2+3, CAR_H/2-9,  CAR_W-6, 5);
+    // Siren flash — alternates only in CHASE mode
+    ctx.fillStyle = Math.sin(pulse*3) > 0 ? '#ff0000' : '#0000ff';
+    ctx.fillRect(-4, -CAR_H/2-3, 8, 3);
   }
-
   ctx.restore();
 }
 
 function drawCops(ox, oy) {
   for (const cop of cops) {
     const sx = cop.x - ox, sy = cop.y - oy;
-    if (sx < -60 || sx > CANVAS_W + 60 || sy < -60 || sy > CANVAS_H + 60) continue;
-    // Cop angle = toward player
-    const dx = Player.x - cop.x, dy = Player.y - cop.y;
-    const a = Math.atan2(dx, -dy) * 180 / Math.PI;
-    drawCar(sx, sy, a, false);
+    if (sx < -60 || sx > CANVAS_W+60 || sy < -60 || sy > CANVAS_H+60) continue;
+    drawCar(sx, sy, cop.angle, false);
   }
+}
+
+// Draw circular park countdown at car screen position
+function drawParkCountdown(screenX, screenY) {
+  const elapsed  = PARK_TIMER_DURATION - parkTimerRemaining;
+  const progress = elapsed / PARK_TIMER_DURATION; // 0→1 as timer runs down
+  const radius   = 22;
+  const start    = -Math.PI / 2;
+  const end      = start + (1 - progress) * Math.PI * 2;
+
+  ctx.save();
+  // Outer ring background
+  ctx.beginPath();
+  ctx.arc(screenX, screenY, radius, 0, Math.PI*2);
+  ctx.strokeStyle = 'rgba(80,0,180,0.4)';
+  ctx.lineWidth   = 5;
+  ctx.stroke();
+
+  // Remaining arc (depleting)
+  if (parkTimerRemaining > 0) {
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, radius, start, end, false);
+    const frac = parkTimerRemaining / PARK_TIMER_DURATION;
+    ctx.strokeStyle = frac > 0.5 ? '#cc44ff' : frac > 0.25 ? '#ff8800' : '#ff2200';
+    ctx.lineWidth   = 4;
+    ctx.shadowColor = ctx.strokeStyle;
+    ctx.shadowBlur  = 10;
+    ctx.stroke();
+  }
+
+  // Tick text inside
+  ctx.fillStyle    = '#cc88ff';
+  ctx.font         = 'bold 11px monospace';
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(Math.ceil(parkTimerRemaining) + 's', screenX, screenY);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
 }
 
 function drawHUD() {
-  // Top left: earnings
+  // ── Top left: earnings ───────────────────────────────────────────────────
   ctx.fillStyle = '#00ff55';
-  ctx.font = 'bold 20px monospace';
+  ctx.font      = 'bold 20px monospace';
   ctx.textAlign = 'left';
   ctx.fillText('$' + earnings, 14, 28);
 
-  // Destination arrow hint (if active)
-  if (destination) {
-    ctx.fillStyle = '#ffee00';
-    ctx.font = '11px monospace';
-    const dx = destination.x - Player.x, dy = destination.y - Player.y;
-    const a = Math.atan2(dx, -dy);
-    const arrow = angleToArrow(a);
-    ctx.fillText('DEST ' + arrow, 14, 46);
-  } else if (clients.length > 0) {
+  // ── Passenger status ─────────────────────────────────────────────────────
+  if (workerInCar || isParked) {
+    ctx.save();
+    ctx.fillStyle  = '#ff9944';
+    ctx.font       = 'bold 12px monospace';
+    ctx.textAlign  = 'left';
+    ctx.shadowColor = '#ff6600';
+    ctx.shadowBlur  = 8;
+    ctx.fillText('PASSENGER: IN', 14, 46);
+    ctx.restore();
+  } else if (gamePhase === PHASE.FIND_WORKER && workers.length > 0) {
+    // Hint arrow toward nearest worker
+    const w   = workers[0];
+    const dx  = w.x - Player.x, dy = w.y - Player.y;
+    const a   = Math.atan2(dx, -dy);
     ctx.fillStyle = '#00ff88';
-    ctx.font = '11px monospace';
-    const c = clients[0];
-    const dx = c.x - Player.x, dy = c.y - Player.y;
-    const a = Math.atan2(dx, -dy);
-    ctx.fillText('FARE ' + angleToArrow(a), 14, 46);
+    ctx.font      = '11px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('WORKER ' + angleToArrow(a), 14, 46);
   }
 
-  // Top right: wanted stars
-  ctx.font = '22px monospace';
+  // ── Top right: wanted stars ───────────────────────────────────────────────
+  ctx.font      = '22px monospace';
   ctx.textAlign = 'right';
   for (let i = 0; i < MAX_STARS; i++) {
     ctx.fillStyle = i < wantedLevel ? '#ffee00' : '#333333';
-    ctx.fillText(i < wantedLevel ? '★' : '☆', CANVAS_W - 14 - (MAX_STARS - 1 - i) * 26, 28);
+    ctx.fillText(i < wantedLevel ? '★' : '☆', CANVAS_W - 14 - (MAX_STARS-1-i)*26, 28);
   }
 
-  // Bottom left: title
+  // ── Bottom left: title ───────────────────────────────────────────────────
   ctx.fillStyle = '#666666';
-  ctx.font = '11px monospace';
+  ctx.font      = '11px monospace';
   ctx.textAlign = 'left';
   ctx.fillText('NIGHT SHIFT', 14, CANVAS_H - 14);
 
-  // Bottom center: speed bar
+  // ── Bottom center: park timer HUD OR speed bar ───────────────────────────
   const BAR_W = 120, BAR_H = 8;
-  const bx = (CANVAS_W - BAR_W) / 2;
-  const by = CANVAS_H - 22;
-  ctx.fillStyle = '#222233';
-  ctx.fillRect(bx, by, BAR_W, BAR_H);
-  const speedRatio = Player.speed / MAX_SPEED;
-  const barColor = speedRatio > 0.8 ? '#ff4400' : speedRatio > 0.5 ? '#ffaa00' : '#00ff88';
-  ctx.fillStyle = barColor;
-  ctx.fillRect(bx, by, BAR_W * speedRatio, BAR_H);
-  ctx.strokeStyle = '#444455';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(bx, by, BAR_W, BAR_H);
+  const bx    = (CANVAS_W - BAR_W) / 2;
+  const by    = CANVAS_H - 22;
 
-  // Speed label
-  ctx.fillStyle = '#555566';
-  ctx.font = '10px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('SPD', CANVAS_W / 2, CANVAS_H - 10);
+  if (isParked) {
+    // Show park countdown bar in HUD
+    const frac = parkTimerRemaining / PARK_TIMER_DURATION;
+    ctx.fillStyle = '#111122';
+    ctx.fillRect(bx, by, BAR_W, BAR_H);
+    const barCol = frac > 0.5 ? '#cc44ff' : frac > 0.25 ? '#ff8800' : '#ff2200';
+    ctx.fillStyle = barCol;
+    ctx.fillRect(bx, by, BAR_W * frac, BAR_H);
+    ctx.strokeStyle = '#552288';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(bx, by, BAR_W, BAR_H);
+    ctx.fillStyle   = '#aa66cc';
+    ctx.font        = '10px monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillText('PARKED ' + Math.ceil(parkTimerRemaining) + 's', CANVAS_W/2, CANVAS_H - 10);
+  } else {
+    // Normal speed bar
+    const sr   = Player.speed / MAX_SPEED;
+    const sCol = sr > 0.8 ? '#ff4400' : sr > 0.5 ? '#ffaa00' : '#00ff88';
+    ctx.fillStyle = '#222233';
+    ctx.fillRect(bx, by, BAR_W, BAR_H);
+    ctx.fillStyle = sCol;
+    ctx.fillRect(bx, by, BAR_W * sr, BAR_H);
+    ctx.strokeStyle = '#444455';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(bx, by, BAR_W, BAR_H);
+    ctx.fillStyle   = '#555566';
+    ctx.font        = '10px monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillText('SPD', CANVAS_W/2, CANVAS_H - 10);
+  }
 }
 
 function angleToArrow(rad) {
-  // 8 directions
-  const deg = ((rad * 180 / Math.PI) + 360) % 360;
+  const deg    = ((rad * 180 / Math.PI) + 360) % 360;
   const arrows = ['↑','↗','→','↘','↓','↙','←','↖'];
   return arrows[Math.round(deg / 45) % 8];
 }
 
 function drawBustedScreen() {
   if (bustFlash > 0) {
-    ctx.fillStyle = `rgba(255,0,0,${bustFlash / 30 * 0.7})`;
+    ctx.fillStyle = `rgba(255,0,0,${bustFlash/30*0.7})`;
     ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
     return;
   }
-
-  // Dark overlay
   ctx.fillStyle = 'rgba(0,0,0,0.85)';
   ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
-
   ctx.textAlign = 'center';
-
-  // BUSTED text
   ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 72px monospace';
-  ctx.fillText('BUSTED', CANVAS_W / 2, CANVAS_H / 2 - 40);
-
-  // Red underline
+  ctx.font      = 'bold 72px monospace';
+  ctx.fillText('BUSTED', CANVAS_W/2, CANVAS_H/2 - 40);
   ctx.fillStyle = '#ff2200';
-  ctx.fillRect(CANVAS_W / 2 - 160, CANVAS_H / 2 - 26, 320, 3);
-
-  // Earnings
+  ctx.fillRect(CANVAS_W/2 - 160, CANVAS_H/2 - 26, 320, 3);
   ctx.fillStyle = '#00ff55';
-  ctx.font = 'bold 24px monospace';
-  ctx.fillText('TOTAL EARNINGS: $' + earnings, CANVAS_W / 2, CANVAS_H / 2 + 20);
-
-  // Restart prompt
-  const blink = Math.floor(Date.now() / 500) % 2 === 0;
+  ctx.font      = 'bold 24px monospace';
+  ctx.fillText('TOTAL EARNINGS: $' + earnings, CANVAS_W/2, CANVAS_H/2 + 20);
+  const blink = Math.floor(Date.now()/500) % 2 === 0;
   ctx.fillStyle = blink ? '#ffffff' : '#888888';
-  ctx.font = '16px monospace';
-  ctx.fillText('PRESS SPACE TO RESTART', CANVAS_W / 2, CANVAS_H / 2 + 60);
+  ctx.font      = '16px monospace';
+  ctx.fillText('PRESS SPACE TO RESTART', CANVAS_W/2, CANVAS_H/2 + 60);
 }
 
 // ─── Main Loop ──────────────────────────────────────────────────────────────
 function render() {
   const { ox, oy } = getCameraOffset();
 
-  // Background
   ctx.fillStyle = COLOR.BG;
   ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
-  // Draw world
   drawMap(ox, oy);
   drawWindows(ox, oy);
   drawNeonSigns(ox, oy);
@@ -765,12 +904,25 @@ function render() {
   drawCops(ox, oy);
 
   // Player car
-  drawCar(CANVAS_W / 2, CANVAS_H / 2, Player.angle, true);
+  drawCar(CANVAS_W/2, CANVAS_H/2, Player.angle, true);
 
-  // HUD
+  // Park countdown ring (drawn at car center on screen)
+  if (isParked) {
+    drawParkCountdown(CANVAS_W/2, CANVAS_H/2 - CAR_H - 14);
+  }
+
+  // Near-cop warning flash at screen edge (parked state — visual stress)
+  if (nearCopWarningTimer > 0) {
+    const alpha = (nearCopWarningTimer / 30) * 0.55;
+    ctx.save();
+    ctx.strokeStyle = `rgba(255,0,0,${alpha})`;
+    ctx.lineWidth   = 16;
+    ctx.strokeRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.restore();
+  }
+
   drawHUD();
 
-  // Busted overlay
   if (gameState === STATE.BUSTED) {
     drawBustedScreen();
   }
@@ -783,24 +935,18 @@ function loop() {
 }
 
 // ─── Input ──────────────────────────────────────────────────────────────────
-document.addEventListener('keydown', e => {
-  keys[e.key] = true;
-  e.preventDefault();
-});
-document.addEventListener('keyup', e => {
-  keys[e.key] = false;
-});
+document.addEventListener('keydown', e => { keys[e.key] = true;  e.preventDefault(); });
+document.addEventListener('keyup',   e => { keys[e.key] = false; });
 
 // ─── Bootstrap ──────────────────────────────────────────────────────────────
 window.addEventListener('load', () => {
   canvas = document.getElementById('gameCanvas');
   ctx    = canvas.getContext('2d');
-
   initGame();
   requestAnimationFrame(loop);
 });
 
-// ─── Exported Game State (top-level) ────────────────────────────────────────
+// ─── Exported Game State ────────────────────────────────────────────────────
 const Game = {
   get state()    { return gameState; },
   get earnings() { return earnings; },
@@ -810,6 +956,8 @@ const Game = {
 };
 
 // Exports visible at module level: Game, Audio, Player
+// Window exports: window.TILE, window.getTile, window.CopPatrolRoutes,
+//                 window.NearestCopDistance, window.GameState
 </script>
 </body>
 </html>
