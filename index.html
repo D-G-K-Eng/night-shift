@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NIGHT SHIFT</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a12;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: monospace;
+  }
+  canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script>
+'use strict';
+
+// ─── Audio Engine (Hammerz) ────────────────────────────────────────────────
+// Synthwave procedural audio. All Web Audio API — no samples.
+//
+// Public API (matches Viv's stubs exactly):
+//   Audio.init()                    — call on first user gesture
+//   Audio.setEngineSpeed(0-1)       — call every frame
+//   Audio.playPickup()              — fare picked up
+//   Audio.playDropoff(earnings)     — fare dropped off, earnings = $ amount
+//   Audio.setCopSiren(wantedLevel)  — 0-3, 0 = off
+//   Audio.startAmbience()           — call once on game start
+// ──────────────────────────────────────────────────────────────────────────
+
+const Audio = (() => {
+  let ctx = null;
+
+  // Master output gain
+  let masterGain = null;
+
+  // ── Engine sound ────────────────────────────────────────────────────────
+  // Two detuned oscillators + filter, frequency mapped to speed.
+  let engineOsc1 = null, engineOsc2 = null;
+  let engineFilter = null, engineGain = null;
+  let _engineSpeed = 0;
+
+  const ENGINE_IDLE_FREQ = 80;
+  const ENGINE_MAX_FREQ  = 320;
+  const ENGINE_DETUNE    = 7; // cents of detuning between the two oscs
+
+  // ── City ambience ────────────────────────────────────────────────────────
+  // Low bass pad + filtered noise (city hiss) — always running
+  let ambienceRunning = false;
+  let noiseSrc = null, noiseFilter = null, noiseGain = null;
+  let bassPad = null, bassPadGain = null;
+
+  // ── Cop siren ────────────────────────────────────────────────────────────
+  // Two-tone alternating American siren, rate scales with wanted level
+  let sirenOsc = null, sirenGain = null;
+  let sirenInterval = null;
+  let sirenToggle = false;
+  let _wantedLevel = 0;
+
+  const SIREN_FREQ_HI = 960;
+  const SIREN_FREQ_LO = 770;
+  const SIREN_RATES = [0, 800, 600, 350]; // ms per toggle per star level
+
+  // ── Wanted level ambience layers ─────────────────────────────────────────
+  // One looping synth loop, layers unmuted as stars increase.
+  // Layer 0: bass (always on when game running)
+  // Layer 1: hi-hat (star 2+)
+  // Layer 2: lead stab (star 3)
+  const wantedLayers = [];
+
+  // ─── Init ───────────────────────────────────────────────────────────────
+  function init() {
+    if (ctx) return;
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+    masterGain = ctx.createGain();
+    masterGain.gain.setValueAtTime(0.8, ctx.currentTime);
+    masterGain.connect(ctx.destination);
+
+    _buildEngine();
+    _buildSiren();
+    _buildWantedLayers();
+  }
+
+  // ─── Engine ─────────────────────────────────────────────────────────────
+  function _buildEngine() {
+    engineFilter = ctx.createBiquadFilter();
+    engineFilter.type = 'lowpass';
+    engineFilter.frequency.setValueAtTime(400, ctx.currentTime);
+    engineFilter.Q.setValueAtTime(2, ctx.currentTime);
+
+    engineGain = ctx.createGain();
+    engineGain.gain.setValueAtTime(0.18, ctx.currentTime);
+
+    engineOsc1 = ctx.createOscillator();
+    engineOsc1.type = 'sawtooth';
+    engineOsc1.frequency.setValueAtTime(ENGINE_IDLE_FREQ, ctx.currentTime);
+    engineOsc1.detune.setValueAtTime(ENGINE_DETUNE, ctx.currentTime);
+
+    engineOsc2 = ctx.createOscillator();
+    engineOsc2.type = 'sawtooth';
+    engineOsc2.frequency.setValueAtTime(ENGINE_IDLE_FREQ, ctx.currentTime);
+    engineOsc2.detune.setValueAtTime(-ENGINE_DETUNE, ctx.currentTime);
+
+    engineOsc1.connect(engineFilter);
+    engineOsc2.connect(engineFilter);
+    engineFilter.connect(engineGain);
+    engineGain.connect(masterGain);
+
+    engineOsc1.start();
+    engineOsc2.start();
+  }
+
+  function setEngineSpeed(norm) {
+    if (!ctx) return;
+    _engineSpeed = norm;
+    const freq = ENGINE_IDLE_FREQ + (ENGINE_MAX_FREQ - ENGINE_IDLE_FREQ) * norm;
+    const ramp = ctx.currentTime + 0.05; // slew
+    engineOsc1.frequency.linearRampToValueAtTime(freq, ramp);
+    engineOsc2.frequency.linearRampToValueAtTime(freq, ramp);
+    // Filter opens with speed
+    engineFilter.frequency.linearRampToValueAtTime(200 + 1800 * norm, ramp);
+    // Volume up slightly at speed
+    engineGain.gain.linearRampToValueAtTime(0.10 + 0.12 * norm, ramp);
+  }
+
+  // ─── Ambience ────────────────────────────────────────────────────────────
+  function startAmbience() {
+    if (!ctx || ambienceRunning) return;
+    ambienceRunning = true;
+
+    // City hiss — filtered white noise
+    const bufLen = ctx.sampleRate * 2;
+    const noiseBuffer = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+
+    noiseSrc = ctx.createBufferSource();
+    noiseSrc.buffer = noiseBuffer;
+    noiseSrc.loop = true;
+
+    noiseFilter = ctx.createBiquadFilter();
+    noiseFilter.type = 'bandpass';
+    noiseFilter.frequency.setValueAtTime(800, ctx.currentTime);
+    noiseFilter.Q.setValueAtTime(0.4, ctx.currentTime);
+
+    noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.04, ctx.currentTime);
+
+    noiseSrc.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(masterGain);
+    noiseSrc.start();
+
+    // Bass pad — deep sine drone, slow LFO swell
+    bassPad = ctx.createOscillator();
+    bassPad.type = 'sine';
+    bassPad.frequency.setValueAtTime(55, ctx.currentTime); // A1
+
+    const lfo = ctx.createOscillator();
+    lfo.frequency.setValueAtTime(0.12, ctx.currentTime);
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.setValueAtTime(0.03, ctx.currentTime);
+    lfo.connect(lfoGain);
+
+    bassPadGain = ctx.createGain();
+    bassPadGain.gain.setValueAtTime(0, ctx.currentTime);
+    bassPadGain.gain.linearRampToValueAtTime(0.22, ctx.currentTime + 2); // fade in
+
+    lfoGain.connect(bassPadGain.gain);
+    bassPad.connect(bassPadGain);
+    bassPadGain.connect(masterGain);
+    bassPad.start();
+    lfo.start();
+  }
+
+  // ─── Siren ───────────────────────────────────────────────────────────────
+  function _buildSiren() {
+    sirenOsc = ctx.createOscillator();
+    sirenOsc.type = 'square';
+    sirenOsc.frequency.setValueAtTime(SIREN_FREQ_HI, ctx.currentTime);
+
+    // Siren filter to soften the square a bit
+    const sirenFilter = ctx.createBiquadFilter();
+    sirenFilter.type = 'lowpass';
+    sirenFilter.frequency.setValueAtTime(2000, ctx.currentTime);
+
+    sirenGain = ctx.createGain();
+    sirenGain.gain.setValueAtTime(0, ctx.currentTime); // starts silent
+
+    sirenOsc.connect(sirenFilter);
+    sirenFilter.connect(sirenGain);
+    sirenGain.connect(masterGain);
+    sirenOsc.start();
+  }
+
+  function setCopSiren(level) {
+    if (!ctx) return;
+    _wantedLevel = level;
+
+    // Clear existing interval
+    if (sirenInterval) { clearInterval(sirenInterval); sirenInterval = null; }
+
+    if (level === 0) {
+      sirenGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.3);
+      return;
+    }
+
+    const rate = SIREN_RATES[level];
+    sirenGain.gain.linearRampToValueAtTime(0.15 + 0.05 * level, ctx.currentTime + 0.1);
+
+    sirenInterval = setInterval(() => {
+      if (!ctx) return;
+      sirenToggle = !sirenToggle;
+      sirenOsc.frequency.setValueAtTime(
+        sirenToggle ? SIREN_FREQ_HI : SIREN_FREQ_LO,
+        ctx.currentTime
+      );
+    }, rate);
+
+    // Update wanted layer volumes
+    _setWantedLayerLevels(level);
+  }
+
+  // ─── Wanted Level Layers ─────────────────────────────────────────────────
+  // Procedural rhythmic loop built from oscillators + noise bursts.
+  // Each "layer" is a looping pattern driven by setInterval scheduling.
+  // Layer 0: bass pulse (always on in game)
+  // Layer 1: hi-hat tick (star 2+)
+  // Layer 2: stab chord (star 3)
+
+  function _buildWantedLayers() {
+    // Layer 0 — bass pulse: low sine bursts at ~120 BPM (500ms interval)
+    const bassGain = ctx.createGain();
+    bassGain.gain.setValueAtTime(0, ctx.currentTime);
+    bassGain.connect(masterGain);
+
+    let bassInterval = null;
+    function startBass() {
+      if (bassInterval) return;
+      bassInterval = setInterval(() => {
+        if (!ctx) return;
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(55, ctx.currentTime);
+        g.gain.setValueAtTime(0.0, ctx.currentTime);
+        g.gain.linearRampToValueAtTime(0.25, ctx.currentTime + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+        osc.connect(g); g.connect(masterGain);
+        osc.start(); osc.stop(ctx.currentTime + 0.4);
+      }, 500);
+    }
+
+    // Layer 1 — hi-hat: filtered noise burst at 240 BPM (250ms interval)
+    let hatInterval = null;
+    function startHat() {
+      if (hatInterval) return;
+      hatInterval = setInterval(() => {
+        if (!ctx) return;
+        const bufLen = Math.floor(ctx.sampleRate * 0.05);
+        const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < bufLen; i++) d[i] = Math.random() * 2 - 1;
+
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const f = ctx.createBiquadFilter();
+        f.type = 'highpass';
+        f.frequency.setValueAtTime(8000, ctx.currentTime);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.08, ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.04);
+        src.connect(f); f.connect(g); g.connect(masterGain);
+        src.start(); src.stop(ctx.currentTime + 0.05);
+      }, 250);
+    }
+
+    // Layer 2 — stab: quick detuned chord hit every beat
+    let stabInterval = null;
+    function startStab() {
+      if (stabInterval) return;
+      const STAB_FREQS = [110, 138.6, 165]; // A2, C#3, E3 — minor chord
+      stabInterval = setInterval(() => {
+        if (!ctx) return;
+        STAB_FREQS.forEach((freq, i) => {
+          const osc = ctx.createOscillator();
+          const g = ctx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(freq, ctx.currentTime);
+          osc.detune.setValueAtTime((i - 1) * 5, ctx.currentTime);
+          g.gain.setValueAtTime(0.0, ctx.currentTime);
+          g.gain.linearRampToValueAtTime(0.06, ctx.currentTime + 0.01);
+          g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+          osc.connect(g); g.connect(masterGain);
+          osc.start(); osc.stop(ctx.currentTime + 0.2);
+        });
+      }, 500);
+    }
+
+    wantedLayers.push(
+      { start: startBass,  stop: () => { clearInterval(bassInterval); bassInterval = null; }, minStar: 1 },
+      { start: startHat,   stop: () => { clearInterval(hatInterval);  hatInterval  = null; }, minStar: 2 },
+      { start: startStab,  stop: () => { clearInterval(stabInterval); stabInterval = null; }, minStar: 3 },
+    );
+  }
+
+  function _setWantedLayerLevels(level) {
+    for (const layer of wantedLayers) {
+      if (level >= layer.minStar) {
+        layer.start();
+      } else {
+        layer.stop();
+      }
+    }
+  }
+
+  // ─── Pickup / Dropoff jingles ─────────────────────────────────────────────
+  function playPickup() {
+    if (!ctx) return;
+    // Ascending 3-note major chime: C5, E5, G5
+    [523.25, 659.25, 783.99].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+      const t = ctx.currentTime + i * 0.1;
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.18, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+      osc.connect(g); g.connect(masterGain);
+      osc.start(t); osc.stop(t + 0.35);
+    });
+  }
+
+  function playDropoff(earningsAmt) {
+    if (!ctx) return;
+    // Reversed chime (descending) + cash register tick
+    [783.99, 659.25, 523.25].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+      const t = ctx.currentTime + i * 0.08;
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.16, t + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+      osc.connect(g); g.connect(masterGain);
+      osc.start(t); osc.stop(t + 0.3);
+    });
+
+    // Cash register tick — short metallic click
+    const t2 = ctx.currentTime + 0.25;
+    const bufLen = Math.floor(ctx.sampleRate * 0.03);
+    const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufLen * 0.3));
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const f = ctx.createBiquadFilter();
+    f.type = 'bandpass';
+    f.frequency.setValueAtTime(3000, t2);
+    f.Q.setValueAtTime(1, t2);
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.25, t2);
+    src.connect(f); f.connect(g2); g2.connect(masterGain);
+    src.start(t2); src.stop(t2 + 0.05);
+  }
+
+  return { init, setEngineSpeed, playPickup, playDropoff, setCopSiren, startAmbience };
+})();
+
+</script>
+
+<script>
+// ─── Game Layer (Viv) ──────────────────────────────────────────────────────
+// (Audio object is defined above and fulfills all stubs)
+
+const CANVAS_W = 800;
+const CANVAS_H = 600;
+const TILE_SIZE = 32;
+const CITY_TILES = 40;
+const CITY_SIZE = CITY_TILES * TILE_SIZE;
+const BLOCK_SIZE = 4;
+const ROAD_WIDTH = 2;
+const PERIOD = BLOCK_SIZE + ROAD_WIDTH;
+const TILE = { ROAD: 0, BUILDING: 1, SIDEWALK: 2 };
+const COLOR = { ROAD: '#1a1a2e', SIDEWALK: '#2a2a3e', ROAD_MARK: '#ffee00', BG: '#0a0a12' };
+const BUILDING_COLORS = ['#0d0d1a','#1a0d0d','#0d1a0d','#1a1a0d','#0d0d22','#22110d'];
+const NEON_COLORS = ['#ff00aa','#00ffee','#aaff00','#ff6600','#ff0055'];
+const CAR_W = 16, CAR_H = 28;
+const MAX_SPEED = 4.0, ACCELERATION = 0.15, FRICTION = 0.92, TURN_RATE = 3;
+const PICKUP_RADIUS = 20, DROP_RADIUS = 20, COP_CATCH_RADIUS = 20;
+const MIN_DEST_DIST = 200, COP_SPEED = 2.0, MIN_EARNINGS = 10, DROPOFF_DIST_FACTOR = 0.5;
+const STAR_THRESHOLDS = [3, 6, 10], MAX_STARS = 3, COP_SPAWN_DIST = 300;
+
+let canvas, ctx;
+let map, blockColors, neonSigns, windows;
+
+const Player = { x: 0, y: 0, vx: 0, vy: 0, angle: 0, speed: 0 };
+
+let clients = [], destination = null, pickupPos = null;
+let earnings = 0, dropoffs = 0, wantedLevel = 0, cops = [], pulse = 0;
+const keys = {};
+const STATE = { PLAYING: 'PLAYING', BUSTED: 'BUSTED' };
+let gameState = STATE.PLAYING;
+let bustFlash = 0;
+let audioStarted = false;
+
+function isRoadCol(tx) { return (tx % PERIOD) < ROAD_WIDTH; }
+function isRoadRow(ty) { return (ty % PERIOD) < ROAD_WIDTH; }
+
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function generateMap() {
+  map = [];
+  for (let y = 0; y < CITY_TILES; y++) {
+    map[y] = [];
+    for (let x = 0; x < CITY_TILES; x++) {
+      const roadX = isRoadCol(x), roadY = isRoadRow(y);
+      if (roadX || roadY) { map[y][x] = TILE.ROAD; }
+      else {
+        const adj = isRoadCol(x-1)||isRoadCol(x+1)||isRoadRow(y-1)||isRoadRow(y+1);
+        map[y][x] = adj ? TILE.SIDEWALK : TILE.BUILDING;
+      }
+    }
+  }
+  blockColors = [];
+  for (let by = 0; by < CITY_TILES; by++) {
+    blockColors[by] = [];
+    for (let bx = 0; bx < CITY_TILES; bx++) {
+      const seed = Math.floor(by/PERIOD)*100 + Math.floor(bx/PERIOD);
+      blockColors[by][bx] = BUILDING_COLORS[seed % BUILDING_COLORS.length];
+    }
+  }
+  const rng = mulberry32(42);
+  windows = [];
+  for (let y = 0; y < CITY_TILES; y++)
+    for (let x = 0; x < CITY_TILES; x++)
+      if (map[y][x] === TILE.BUILDING)
+        for (let wy = 4; wy < TILE_SIZE-4; wy += 6)
+          for (let wx = 4; wx < TILE_SIZE-4; wx += 6)
+            if (rng() < 0.30)
+              windows.push({ px: x*TILE_SIZE+wx, py: y*TILE_SIZE+wy, bright: rng() > 0.5 });
+
+  const rng2 = mulberry32(99);
+  neonSigns = [];
+  const count = 2 + Math.floor(rng2() * 2);
+  for (let i = 0; i < count; i++) {
+    let tx, ty;
+    do { tx = Math.floor(rng2()*CITY_TILES); ty = Math.floor(rng2()*CITY_TILES); }
+    while (map[ty][tx] !== TILE.BUILDING);
+    neonSigns.push({ px: tx*TILE_SIZE+2, py: ty*TILE_SIZE+2, w: TILE_SIZE-4, h: TILE_SIZE-4, color: NEON_COLORS[Math.floor(rng2()*NEON_COLORS.length)] });
+  }
+}
+
+function isRoadTile(tx, ty) {
+  if (tx<0||ty<0||tx>=CITY_TILES||ty>=CITY_TILES) return false;
+  return map[ty][tx] === TILE.ROAD;
+}
+function randomRoadPos() {
+  let tx,ty;
+  do { tx=Math.floor(Math.random()*CITY_TILES); ty=Math.floor(Math.random()*CITY_TILES); }
+  while (!isRoadTile(tx,ty));
+  return { x: tx*TILE_SIZE+TILE_SIZE/2, y: ty*TILE_SIZE+TILE_SIZE/2 };
+}
+function randomRoadPosFarFrom(px,py,minDist) {
+  let pos, attempts=0;
+  do { pos=randomRoadPos(); attempts++; }
+  while (dist(pos.x,pos.y,px,py)<minDist && attempts<200);
+  return pos;
+}
+function dist(ax,ay,bx,by) { const dx=bx-ax,dy=by-ay; return Math.sqrt(dx*dx+dy*dy); }
+function degToRad(d) { return d*Math.PI/180; }
+function clamp(v,lo,hi) { return Math.max(lo,Math.min(hi,v)); }
+
+function isBuildingAt(wx,wy) {
+  const tx=Math.floor(wx/TILE_SIZE), ty=Math.floor(wy/TILE_SIZE);
+  if (tx<0||ty<0||tx>=CITY_TILES||ty>=CITY_TILES) return true;
+  return map[ty][tx] === TILE.BUILDING;
+}
+function carOverlapsBuilding(cx,cy) {
+  const hw=CAR_W/2,hh=CAR_H/2;
+  return [[cx-hw,cy-hh],[cx+hw,cy-hh],[cx-hw,cy+hh],[cx+hw,cy+hh]].some(([x,y])=>isBuildingAt(x,y));
+}
+
+function spawnCops(targetCount) {
+  while (cops.length<targetCount) {
+    const pos=randomRoadPosFarFrom(Player.x,Player.y,COP_SPAWN_DIST);
+    cops.push({x:pos.x,y:pos.y,vx:0,vy:0});
+  }
+  while (cops.length>targetCount) cops.pop();
+}
+
+function updateWanted() {
+  let newLevel=0;
+  for (let i=0;i<STAR_THRESHOLDS.length;i++) if(dropoffs>=STAR_THRESHOLDS[i]) newLevel=i+1;
+  if (newLevel!==wantedLevel) { wantedLevel=newLevel; Audio.setCopSiren(wantedLevel); spawnCops(wantedLevel); }
+}
+
+function initGame() {
+  generateMap();
+  const startPos=randomRoadPos();
+  Player.x=startPos.x; Player.y=startPos.y;
+  Player.vx=0; Player.vy=0; Player.angle=0; Player.speed=0;
+  clients=[];
+  for(let i=0;i<3;i++) clients.push(randomRoadPosFarFrom(Player.x,Player.y,80));
+  destination=null; pickupPos=null; earnings=0; dropoffs=0; wantedLevel=0; cops=[]; pulse=0;
+  gameState=STATE.PLAYING; bustFlash=0;
+}
+
+function update() {
+  if (gameState===STATE.BUSTED) {
+    if (bustFlash>0) bustFlash--;
+    if (keys[' ']||keys['Space']) initGame();
+    return;
+  }
+  if (!audioStarted && Object.keys(keys).some(k=>keys[k])) {
+    Audio.init(); Audio.startAmbience(); audioStarted=true;
+  }
+  pulse+=0.08;
+  const moving=Math.abs(Player.speed)>0.1;
+  if (moving) {
+    if(keys['ArrowLeft']||keys['a']||keys['A']) Player.angle-=TURN_RATE*(Player.speed/MAX_SPEED);
+    if(keys['ArrowRight']||keys['d']||keys['D']) Player.angle+=TURN_RATE*(Player.speed/MAX_SPEED);
+  }
+  const aRad=degToRad(Player.angle);
+  const fwdX=Math.sin(aRad), fwdY=-Math.cos(aRad);
+  if(keys['ArrowUp']||keys['w']||keys['W']) { Player.vx+=fwdX*ACCELERATION; Player.vy+=fwdY*ACCELERATION; }
+  if(keys['ArrowDown']||keys['s']||keys['S']) { Player.vx-=fwdX*ACCELERATION*0.6; Player.vy-=fwdY*ACCELERATION*0.6; }
+  Player.vx*=FRICTION; Player.vy*=FRICTION;
+  const spd=Math.sqrt(Player.vx*Player.vx+Player.vy*Player.vy);
+  if(spd>MAX_SPEED){Player.vx=(Player.vx/spd)*MAX_SPEED;Player.vy=(Player.vy/spd)*MAX_SPEED;}
+  Player.speed=spd;
+  const newX=Player.x+Player.vx, newY=Player.y+Player.vy;
+  if(!carOverlapsBuilding(newX,newY)){Player.x=newX;Player.y=newY;}
+  else if(!carOverlapsBuilding(newX,Player.y)){Player.x=newX;Player.vy=0;}
+  else if(!carOverlapsBuilding(Player.x,newY)){Player.y=newY;Player.vx=0;}
+  else{Player.vx=0;Player.vy=0;}
+  Player.x=clamp(Player.x,CAR_W/2,CITY_SIZE-CAR_W/2);
+  Player.y=clamp(Player.y,CAR_H/2,CITY_SIZE-CAR_H/2);
+  Audio.setEngineSpeed(Player.speed/MAX_SPEED);
+  if(!destination) {
+    for(let i=clients.length-1;i>=0;i--) {
+      if(dist(Player.x,Player.y,clients[i].x,clients[i].y)<PICKUP_RADIUS){
+        pickupPos={x:Player.x,y:Player.y}; clients.splice(i,1);
+        destination=randomRoadPosFarFrom(Player.x,Player.y,MIN_DEST_DIST);
+        Audio.playPickup(); break;
+      }
+    }
+  }
+  if(destination && dist(Player.x,Player.y,destination.x,destination.y)<DROP_RADIUS){
+    const traveled=pickupPos?dist(pickupPos.x,pickupPos.y,Player.x,Player.y):0;
+    const fare=Math.max(MIN_EARNINGS,Math.round(traveled*DROPOFF_DIST_FACTOR));
+    earnings+=fare; dropoffs++; Audio.playDropoff(fare);
+    destination=null; pickupPos=null;
+    clients.push(randomRoadPosFarFrom(Player.x,Player.y,80));
+    updateWanted();
+  }
+  for(const cop of cops){
+    const dx=Player.x-cop.x,dy=Player.y-cop.y,d=Math.sqrt(dx*dx+dy*dy);
+    if(d>0){cop.vx=(dx/d)*COP_SPEED;cop.vy=(dy/d)*COP_SPEED;}
+    cop.x+=cop.vx; cop.y+=cop.vy;
+    if(dist(cop.x,cop.y,Player.x,Player.y)<COP_CATCH_RADIUS){
+      gameState=STATE.BUSTED; bustFlash=30; Audio.setCopSiren(0); return;
+    }
+  }
+}
+
+function getCameraOffset(){return{ox:Math.round(Player.x-CANVAS_W/2),oy:Math.round(Player.y-CANVAS_H/2)};}
+
+function drawMap(ox,oy){
+  const stx=Math.max(0,Math.floor(ox/TILE_SIZE)),sty=Math.max(0,Math.floor(oy/TILE_SIZE));
+  const etx=Math.min(CITY_TILES-1,Math.ceil((ox+CANVAS_W)/TILE_SIZE)),ety=Math.min(CITY_TILES-1,Math.ceil((oy+CANVAS_H)/TILE_SIZE));
+  for(let ty=sty;ty<=ety;ty++)for(let tx=stx;tx<=etx;tx++){
+    const sx=tx*TILE_SIZE-ox,sy=ty*TILE_SIZE-oy,t=map[ty][tx];
+    if(t===TILE.ROAD)ctx.fillStyle=COLOR.ROAD;
+    else if(t===TILE.SIDEWALK)ctx.fillStyle=COLOR.SIDEWALK;
+    else ctx.fillStyle=blockColors[ty][tx];
+    ctx.fillRect(sx,sy,TILE_SIZE,TILE_SIZE);
+  }
+  ctx.strokeStyle=COLOR.ROAD_MARK;ctx.lineWidth=1;ctx.setLineDash([6,10]);
+  for(let ty=sty;ty<=ety;ty++)for(let tx=stx;tx<=etx;tx++){
+    if(map[ty][tx]!==TILE.ROAD)continue;
+    const sx=tx*TILE_SIZE-ox,sy=ty*TILE_SIZE-oy;
+    const rH=ty>0&&map[ty-1][tx]===TILE.ROAD&&ty<CITY_TILES-1&&map[ty+1][tx]===TILE.ROAD;
+    const rV=tx>0&&map[ty][tx-1]===TILE.ROAD&&tx<CITY_TILES-1&&map[ty][tx+1]===TILE.ROAD;
+    if(rH&&!rV){ctx.beginPath();ctx.moveTo(sx+TILE_SIZE/2,sy);ctx.lineTo(sx+TILE_SIZE/2,sy+TILE_SIZE);ctx.stroke();}
+    else if(rV&&!rH){ctx.beginPath();ctx.moveTo(sx,sy+TILE_SIZE/2);ctx.lineTo(sx+TILE_SIZE,sy+TILE_SIZE/2);ctx.stroke();}
+  }
+  ctx.setLineDash([]);
+}
+
+function drawWindows(ox,oy){
+  const wx1=ox,wy1=oy,wx2=ox+CANVAS_W,wy2=oy+CANVAS_H;
+  for(const w of windows){
+    if(w.px<wx1||w.px>wx2||w.py<wy1||w.py>wy2)continue;
+    ctx.fillStyle=w.bright?'#ffffcc':'#ffee88';
+    ctx.fillRect(w.px-ox,w.py-oy,2,2);
+  }
+}
+
+function drawNeonSigns(ox,oy){
+  for(const n of neonSigns){
+    const sx=n.px-ox,sy=n.py-oy;
+    if(sx+n.w<0||sx>CANVAS_W||sy+n.h<0||sy>CANVAS_H)continue;
+    ctx.save();ctx.shadowColor=n.color;ctx.shadowBlur=12;
+    ctx.fillStyle=n.color+'55';ctx.fillRect(sx,sy,n.w,n.h);
+    ctx.strokeStyle=n.color;ctx.lineWidth=2;ctx.strokeRect(sx,sy,n.w,n.h);
+    ctx.restore();
+  }
+}
+
+function drawWaypoints(ox,oy){
+  const p=0.6+0.4*Math.sin(pulse),r=10+4*Math.sin(pulse);
+  for(const c of clients){
+    const sx=c.x-ox,sy=c.y-oy;
+    if(sx<-60||sx>CANVAS_W+60||sy<-60||sy>CANVAS_H+60)continue;
+    ctx.save();ctx.globalAlpha=p;ctx.shadowColor='#00ff55';ctx.shadowBlur=20;
+    ctx.strokeStyle='#00ff55';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(sx,sy,r,0,Math.PI*2);ctx.stroke();ctx.restore();
+    ctx.fillStyle='#00ff88';ctx.font='9px monospace';ctx.textAlign='center';
+    ctx.fillText('FARE',sx,sy-r-4);
+  }
+  if(destination){
+    const sx=destination.x-ox,sy=destination.y-oy;
+    if(sx>=-60&&sx<=CANVAS_W+60&&sy>=-60&&sy<=CANVAS_H+60){
+      ctx.save();ctx.globalAlpha=p;ctx.shadowColor='#ffee00';ctx.shadowBlur=20;
+      ctx.strokeStyle='#ffee00';ctx.lineWidth=2;
+      ctx.beginPath();ctx.arc(sx,sy,r,0,Math.PI*2);ctx.stroke();ctx.restore();
+      ctx.fillStyle='#ffee55';ctx.font='9px monospace';ctx.textAlign='center';
+      ctx.fillText('DEST',sx,sy-r-4);
+    }
+  }
+}
+
+function drawCar(cx,cy,angle,isPlayer){
+  ctx.save();ctx.translate(cx,cy);ctx.rotate(degToRad(angle));
+  if(isPlayer){
+    ctx.fillStyle='#dddddd';ctx.fillRect(-CAR_W/2,-CAR_H/2,CAR_W,CAR_H);
+    ctx.fillStyle='#ffee55';ctx.fillRect(-CAR_W/2+2,-CAR_H/2,4,3);ctx.fillRect(CAR_W/2-6,-CAR_H/2,4,3);
+    ctx.fillStyle='#ff2200';ctx.fillRect(-CAR_W/2+2,CAR_H/2-3,4,3);ctx.fillRect(CAR_W/2-6,CAR_H/2-3,4,3);
+    ctx.fillStyle='#334455';ctx.fillRect(-CAR_W/2+3,-CAR_H/2+4,CAR_W-6,6);
+  } else {
+    ctx.save();ctx.shadowColor='#0088ff';ctx.shadowBlur=12;
+    ctx.fillStyle='#aaccff';ctx.fillRect(-CAR_W/2,-CAR_H/2,CAR_W,CAR_H);ctx.restore();
+    ctx.fillStyle='#0044cc';
+    ctx.fillRect(-CAR_W/2+3,-CAR_H/2+4,CAR_W-6,5);
+    ctx.fillRect(-CAR_W/2+3,CAR_H/2-9,CAR_W-6,5);
+    ctx.fillStyle=Math.sin(pulse*3)>0?'#ff0000':'#0000ff';
+    ctx.fillRect(-4,-CAR_H/2-3,8,3);
+  }
+  ctx.restore();
+}
+
+function drawCops(ox,oy){
+  for(const cop of cops){
+    const sx=cop.x-ox,sy=cop.y-oy;
+    if(sx<-60||sx>CANVAS_W+60||sy<-60||sy>CANVAS_H+60)continue;
+    const dx=Player.x-cop.x,dy=Player.y-cop.y;
+    drawCar(sx,sy,Math.atan2(dx,-dy)*180/Math.PI,false);
+  }
+}
+
+function angleToArrow(rad){
+  const deg=((rad*180/Math.PI)+360)%360;
+  return ['↑','↗','→','↘','↓','↙','←','↖'][Math.round(deg/45)%8];
+}
+
+function drawHUD(){
+  ctx.fillStyle='#00ff55';ctx.font='bold 20px monospace';ctx.textAlign='left';ctx.fillText('$'+earnings,14,28);
+  if(destination){
+    ctx.fillStyle='#ffee00';ctx.font='11px monospace';
+    const dx=destination.x-Player.x,dy=destination.y-Player.y;
+    ctx.fillText('DEST '+angleToArrow(Math.atan2(dx,-dy)),14,46);
+  } else if(clients.length>0){
+    ctx.fillStyle='#00ff88';ctx.font='11px monospace';
+    const c=clients[0],dx=c.x-Player.x,dy=c.y-Player.y;
+    ctx.fillText('FARE '+angleToArrow(Math.atan2(dx,-dy)),14,46);
+  }
+  ctx.font='22px monospace';ctx.textAlign='right';
+  for(let i=0;i<MAX_STARS;i++){
+    ctx.fillStyle=i<wantedLevel?'#ffee00':'#333333';
+    ctx.fillText(i<wantedLevel?'★':'☆',CANVAS_W-14-(MAX_STARS-1-i)*26,28);
+  }
+  ctx.fillStyle='#666666';ctx.font='11px monospace';ctx.textAlign='left';ctx.fillText('NIGHT SHIFT',14,CANVAS_H-14);
+  const BAR_W=120,BAR_H=8,bx=(CANVAS_W-BAR_W)/2,by=CANVAS_H-22;
+  ctx.fillStyle='#222233';ctx.fillRect(bx,by,BAR_W,BAR_H);
+  const sr=Player.speed/MAX_SPEED;
+  ctx.fillStyle=sr>0.8?'#ff4400':sr>0.5?'#ffaa00':'#00ff88';
+  ctx.fillRect(bx,by,BAR_W*sr,BAR_H);
+  ctx.strokeStyle='#444455';ctx.lineWidth=1;ctx.strokeRect(bx,by,BAR_W,BAR_H);
+  ctx.fillStyle='#555566';ctx.font='10px monospace';ctx.textAlign='center';ctx.fillText('SPD',CANVAS_W/2,CANVAS_H-10);
+}
+
+function drawBustedScreen(){
+  if(bustFlash>0){ctx.fillStyle=`rgba(255,0,0,${bustFlash/30*0.7})`;ctx.fillRect(0,0,CANVAS_W,CANVAS_H);return;}
+  ctx.fillStyle='rgba(0,0,0,0.85)';ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+  ctx.textAlign='center';
+  ctx.fillStyle='#ffffff';ctx.font='bold 72px monospace';ctx.fillText('BUSTED',CANVAS_W/2,CANVAS_H/2-40);
+  ctx.fillStyle='#ff2200';ctx.fillRect(CANVAS_W/2-160,CANVAS_H/2-26,320,3);
+  ctx.fillStyle='#00ff55';ctx.font='bold 24px monospace';ctx.fillText('TOTAL EARNINGS: $'+earnings,CANVAS_W/2,CANVAS_H/2+20);
+  const blink=Math.floor(Date.now()/500)%2===0;
+  ctx.fillStyle=blink?'#ffffff':'#888888';ctx.font='16px monospace';ctx.fillText('PRESS SPACE TO RESTART',CANVAS_W/2,CANVAS_H/2+60);
+}
+
+function renderGame(){
+  const{ox,oy}=getCameraOffset();
+  ctx.fillStyle=COLOR.BG;ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+  drawMap(ox,oy);drawWindows(ox,oy);drawNeonSigns(ox,oy);drawWaypoints(ox,oy);drawCops(ox,oy);
+  drawCar(CANVAS_W/2,CANVAS_H/2,Player.angle,true);
+  drawHUD();
+  if(gameState===STATE.BUSTED) drawBustedScreen();
+}
+
+function loop(){update();renderGame();requestAnimationFrame(loop);}
+
+document.addEventListener('keydown',e=>{keys[e.key]=true;e.preventDefault();});
+document.addEventListener('keyup',e=>{keys[e.key]=false;});
+
+window.addEventListener('load',()=>{
+  canvas=document.getElementById('gameCanvas');
+  ctx=canvas.getContext('2d');
+  initGame();
+  requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
