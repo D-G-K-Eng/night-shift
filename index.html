@@ -180,6 +180,9 @@ const Audio = (() => {
     bassPadGain.connect(masterGain);
     bassPad.start();
     lfo.start();
+
+    // Start 70s porno music layer
+    startPornoMusic();
   }
 
   // ─── Siren ───────────────────────────────────────────────────────────────
@@ -323,6 +326,134 @@ const Audio = (() => {
     }
   }
 
+  // ─── 70s Porno Music Layer ────────────────────────────────────────────────
+  // Wah guitar + walking bass + sleazy brass stabs. All procedural Web Audio.
+  // Runs as a looping pattern on top of city ambience.
+  // BPM: 100 (600ms per beat, 300ms per 8th note)
+  //
+  // Elements:
+  //   Walking bass: Eb2 pentatonic pattern, fingered-bass tone (sawtooth + LP filter)
+  //   Wah guitar:   sawtooth osc through sweeping bandpass filter (auto-wah envelope)
+  //   Brass stab:   two-voice sawtooth chord hit, short envelope, slight detuning
+  let pornoRunning = false;
+  let pornoIntervals = [];
+  const PORNO_BPM = 100;
+  const PORNO_BEAT = 60000 / PORNO_BPM;  // ms per beat
+  const PORNO_8TH  = PORNO_BEAT / 2;
+
+  function startPornoMusic() {
+    if (!ctx || pornoRunning) return;
+    pornoRunning = true;
+
+    // ── Walking bass ────────────────────────────────────────────────────────
+    // Eb2 (77.78Hz) pentatonic root pattern: root, 5th, b7, root up
+    // repeating 4-note riff, one note per beat
+    const BASS_NOTES = [77.78, 116.54, 138.59, 155.56]; // Eb2, Bb2, Db3, Eb3
+    let bassStep = 0;
+    pornoIntervals.push(setInterval(() => {
+      if (!ctx) return;
+      const freq = BASS_NOTES[bassStep % BASS_NOTES.length];
+      bassStep++;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+
+      // Finger-bass tone: sharp LP filter, slight resonance
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'lowpass';
+      filt.frequency.setValueAtTime(600, ctx.currentTime);
+      filt.frequency.exponentialRampToValueAtTime(200, ctx.currentTime + 0.18);
+      filt.Q.setValueAtTime(3, ctx.currentTime);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0, ctx.currentTime);
+      g.gain.linearRampToValueAtTime(0.28, ctx.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
+
+      osc.connect(filt); filt.connect(g); g.connect(masterGain);
+      osc.start(); osc.stop(ctx.currentTime + 0.5);
+    }, PORNO_BEAT));
+
+    // ── Wah guitar ──────────────────────────────────────────────────────────
+    // Sawtooth through auto-wah bandpass — filter sweeps up on each hit.
+    // Fires on beats 2 and 4 (offbeat), classic funk rhythm guitar position.
+    let wahBeat = 0;
+    const WAH_CHORD = [155.56, 195.99, 233.08]; // Eb3, G3, Bb3 — Eb major
+    pornoIntervals.push(setInterval(() => {
+      wahBeat++;
+      if (wahBeat % 2 !== 0) return; // only on even beats (2, 4)
+      if (!ctx) return;
+
+      WAH_CHORD.forEach((freq, vi) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        osc.detune.setValueAtTime((vi - 1) * 8, ctx.currentTime);
+
+        // Auto-wah: bandpass sweeping 400→2200Hz in 0.12s then decay
+        const wah = ctx.createBiquadFilter();
+        wah.type = 'bandpass';
+        wah.Q.setValueAtTime(8, ctx.currentTime);
+        wah.frequency.setValueAtTime(400, ctx.currentTime);
+        wah.frequency.linearRampToValueAtTime(2200, ctx.currentTime + 0.12);
+        wah.frequency.exponentialRampToValueAtTime(400, ctx.currentTime + 0.35);
+
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, ctx.currentTime);
+        g.gain.linearRampToValueAtTime(0.10, ctx.currentTime + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
+
+        osc.connect(wah); wah.connect(g); g.connect(masterGain);
+        osc.start(); osc.stop(ctx.currentTime + 0.35);
+      });
+    }, PORNO_BEAT));
+
+    // ── Brass stab ──────────────────────────────────────────────────────────
+    // Short two-voice stab on beat 3 of every 2-bar phrase (every 8 beats).
+    // Eb major 7 chord voiced for sleazy brass feel.
+    let brassCount = 0;
+    const BRASS_VOICING = [
+      [233.08, 277.18],  // Bb3 + Db4
+      [311.13, 369.99],  // Eb4 + F#4 (slightly dissonant — exactly right)
+    ];
+    pornoIntervals.push(setInterval(() => {
+      brassCount++;
+      if (brassCount % 8 !== 3) return; // beat 3 of the 2-bar phrase
+      if (!ctx) return;
+
+      BRASS_VOICING.forEach(([f1, f2]) => {
+        [f1, f2].forEach((freq, vi) => {
+          const osc = ctx.createOscillator();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(freq, ctx.currentTime);
+          osc.detune.setValueAtTime(vi * 6, ctx.currentTime); // slight detune per voice
+
+          // Brass-ish tone: LP filter with a small resonance bump
+          const filt = ctx.createBiquadFilter();
+          filt.type = 'lowpass';
+          filt.frequency.setValueAtTime(3000, ctx.currentTime);
+          filt.frequency.exponentialRampToValueAtTime(1200, ctx.currentTime + 0.1);
+          filt.Q.setValueAtTime(2, ctx.currentTime);
+
+          const g = ctx.createGain();
+          g.gain.setValueAtTime(0, ctx.currentTime);
+          g.gain.linearRampToValueAtTime(0.13, ctx.currentTime + 0.015); // punchy attack
+          g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
+
+          osc.connect(filt); filt.connect(g); g.connect(masterGain);
+          osc.start(); osc.stop(ctx.currentTime + 0.25);
+        });
+      });
+    }, PORNO_BEAT));
+  }
+
+  function stopPornoMusic() {
+    for (const id of pornoIntervals) clearInterval(id);
+    pornoIntervals = [];
+    pornoRunning = false;
+  }
+
   // ─── Pickup / Dropoff jingles ─────────────────────────────────────────────
   function playPickup() {
     if (!ctx) return;
@@ -375,7 +506,7 @@ const Audio = (() => {
     src.start(t2); src.stop(t2 + 0.05);
   }
 
-  return { init, setEngineSpeed, playPickup, playDropoff, setCopSiren, startAmbience };
+  return { init, setEngineSpeed, playPickup, playDropoff, setCopSiren, startAmbience, startPornoMusic, stopPornoMusic };
 })();
 
 </script>
