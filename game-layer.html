@@ -1067,7 +1067,7 @@ function drawParkCountdown(screenX, screenY) {
   ctx.font         = 'bold 11px monospace';
   ctx.textAlign    = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(Math.ceil(parkTimerRemaining) + 's', screenX, screenY);
+  const _fi = Math.min(5, Math.ceil(parkTimerRemaining)); ctx.font = "bold 9px monospace"; ctx.fillText(PARK_FLAVOR[_fi], screenX, screenY);
   ctx.textBaseline = 'alphabetic';
   ctx.restore();
 }
