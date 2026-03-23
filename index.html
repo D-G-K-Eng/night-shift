@@ -869,6 +869,8 @@ const COP_CHASE_RADIUS      = 80;   // cop switches to CHASE within this dist (w
 const COP_NEAR_PARK_RADIUS  = 120;  // edge-flash when parked and cop this close
 const PARK_SPEED_THRESHOLD  = 0.3;
 const PARK_TIMER_DURATION   = 5;    // seconds
+const EXPOSED_PARK_DURATION = 3;    // seconds
+const EXPOSED_PARK_BONUS    = 15;   // $ added to payout
 const COP_PATROL_SPEED      = 1.5;
 const COP_CHASE_SPEED       = 2.8;
 const COP_SEARCH_SPEED      = 2.0;
@@ -884,10 +886,11 @@ const MAX_STARS             = 3;
 
 // Game phases
 const PHASE = {
-  FIND_WORKER: 'FIND_WORKER',  // looking for worker on sidewalk
-  HAS_WORKER:  'HAS_WORKER',   // worker in car, find hidden park
-  PARKED:      'PARKED',       // at hidden park, timer running
-  DROPOFF:     'DROPOFF',      // drive to drop-off tile
+  FIND_WORKER:  'FIND_WORKER',   // looking for worker on sidewalk
+  HAS_WORKER:   'HAS_WORKER',    // worker in car, find hidden park
+  PARKED:       'PARKED',        // at hidden park, timer running
+  EXPOSED_PARK: 'EXPOSED_PARK',  // parked on open road tile, cops still active
+  DROPOFF:      'DROPOFF',       // drive to drop-off tile
 };
 
 // ─── State ─────────────────────────────────────────────────────────────────
@@ -908,6 +911,7 @@ let pulse      = 0;
 let gamePhase          = PHASE.FIND_WORKER;
 let workerInCar        = false;
 let isParked           = false;
+let isExposedParked    = false;
 let parkTimerEnd       = 0;
 let parkTimerRemaining = 0;
 let dropoffEarnings    = 0;
@@ -955,7 +959,7 @@ window.GameState = {
   get parked()       { return isParked; },
   get parkTimer()    { return parkTimerRemaining; },
   get workerInCar()  { return workerInCar; },
-  get parkExposed()  { return gamePhase === 'EXPOSED_PARK'; },
+  get parkExposed()  { return isExposedParked; },
 };
 
 // ─── Tile Helpers ───────────────────────────────────────────────────────────
@@ -1302,6 +1306,7 @@ function initGame() {
   gamePhase           = PHASE.FIND_WORKER;
   workerInCar         = false;
   isParked            = false;
+  isExposedParked     = false;
   parkTimerEnd        = 0;
   parkTimerRemaining  = 0;
   dropoffEarnings     = 0;
@@ -1416,6 +1421,18 @@ function update() {
       triggerParkCopNudge();
     }
 
+    // Exposed parking: park on any ROAD tile (not hidden park)
+    const onRoad = map[pty] && map[pty][ptx] === TILE.ROAD;
+    if (onRoad && Player.speed < PARK_SPEED_THRESHOLD) {
+      gamePhase          = PHASE.EXPOSED_PARK;
+      isExposedParked    = true;
+      isParked           = false;  // not a hidden park — cops still active
+      parkTimerEnd       = Date.now() + EXPOSED_PARK_DURATION * 1000;
+      parkTimerRemaining = EXPOSED_PARK_DURATION;
+      Player.vx = 0; Player.vy = 0;
+      Audio.setExposedParkState(true);
+    }
+
   } else if (gamePhase === PHASE.PARKED) {
     const now = Date.now();
     parkTimerRemaining = Math.max(0, (parkTimerEnd - now) / 1000);
@@ -1426,6 +1443,18 @@ function update() {
       Audio.setParkState(false);
       dropoffEarnings = 15; // placeholder; final calc at drop-off
       dropoffPos  = randomRoadPosBetween(Player.x, Player.y, DROPOFF_MIN_DIST, DROPOFF_MAX_DIST);
+    }
+
+  } else if (gamePhase === PHASE.EXPOSED_PARK) {
+    const now = Date.now();
+    parkTimerRemaining = Math.max(0, (parkTimerEnd - now) / 1000);
+    if (parkTimerRemaining <= 0) {
+      isExposedParked = false;
+      workerInCar     = false;
+      gamePhase       = PHASE.DROPOFF;
+      Audio.setExposedParkState(false);
+      dropoffEarnings = 15 + EXPOSED_PARK_BONUS + Math.max(0, Math.min(30, Math.round(30 - (Date.now() - pickupTime) / 1000)));
+      dropoffPos = randomRoadPosBetween(Player.x, Player.y, DROPOFF_MIN_DIST, DROPOFF_MAX_DIST);
     }
 
   } else if (gamePhase === PHASE.DROPOFF) {
@@ -1581,10 +1610,12 @@ function update() {
 
     // BUST: cop reaches player while worker is in car AND not in hidden park
     if (workerInCar && !isParked && pd < COP_BUST_RADIUS) {
+      isExposedParked = false;
       gameState = STATE.BUSTED;
       bustFlash = 30;
       Audio.setCopSiren(0);
       Audio.setParkState(false);
+      Audio.setExposedParkState(false);
       return;
     }
   }
@@ -1949,6 +1980,19 @@ function drawHUD() {
     ctx.textAlign   = 'center';
     const flavorIdx = Math.min(5, Math.ceil(parkTimerRemaining));
     ctx.fillText(PARK_FLAVOR[flavorIdx], CANVAS_W/2, CANVAS_H - 10);
+  } else if (gamePhase === PHASE.EXPOSED_PARK) {
+    const frac = parkTimerRemaining / EXPOSED_PARK_DURATION;
+    ctx.fillStyle = '#332200';
+    ctx.fillRect(bx, by, BAR_W, BAR_H);
+    ctx.fillStyle = '#ffcc00';
+    ctx.fillRect(bx, by, BAR_W * frac, BAR_H);
+    ctx.strokeStyle = '#886600';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(bx, by, BAR_W, BAR_H);
+    ctx.fillStyle   = '#ffee44';
+    ctx.font        = '10px monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillText('EXPOSED — ' + Math.ceil(parkTimerRemaining) + 's  (+$' + EXPOSED_PARK_BONUS + ')', CANVAS_W/2, CANVAS_H - 10);
   } else {
     // Normal speed bar
     const sr   = Player.speed / MAX_SPEED;
@@ -2067,6 +2111,24 @@ function render() {
 
   // Player car
   drawCar(CANVAS_W/2, CANVAS_H/2, Player.angle, true);
+
+  // Exposed park hint: faint yellow ring when speed < 0.5 on road tile with worker
+  if (gamePhase === PHASE.HAS_WORKER && Player.speed < 0.5) {
+    const ptx = Math.floor(Player.x / TILE_SIZE);
+    const pty = Math.floor(Player.y / TILE_SIZE);
+    if (map[pty] && map[pty][ptx] === TILE.ROAD) {
+      ctx.save();
+      ctx.globalAlpha  = 0.3 * (1 - Player.speed / 0.5);
+      ctx.strokeStyle  = '#ffee44';
+      ctx.lineWidth    = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(CANVAS_W / 2, CANVAS_H / 2, 28, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+  }
 
   // Park countdown ring (drawn at car center on screen)
   if (isParked) {
