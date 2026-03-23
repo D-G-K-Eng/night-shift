@@ -459,14 +459,11 @@ const Audio = (() => {
       tickInterval = setInterval(() => {
         if (!ctx) return;
         _tickStep++;
-        // Pitch: starts at 1200Hz, rises by 80Hz per tick (urgency)
         const freq = Math.min(2400, 1200 + _tickStep * 80);
-
         const bufLen = Math.floor(ctx.sampleRate * 0.02);
         const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
         const d = buf.getChannelData(0);
         for (let i = 0; i < bufLen; i++) d[i] = (Math.random()*2-1) * Math.exp(-i/(bufLen*0.15));
-
         const src = ctx.createBufferSource();
         src.buffer = buf;
         const f = ctx.createBiquadFilter();
@@ -486,10 +483,71 @@ const Audio = (() => {
       if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
       _tickStep = 0;
 
-      // Engine back: ramp up based on current speed
       if (engineGain) {
         const targetVol = 0.10 + 0.12 * _engineSpeed;
         engineGain.gain.linearRampToValueAtTime(targetVol, ctx.currentTime + 0.3);
+      }
+    }
+  }
+
+  // Exposed parking — parked on a road tile, cops can still spot you.
+  // Audio arc: engine stays at idle (no fadeout), no heartbeat tension,
+  // rumble immediately hot, porno music cuts (silence = danger cue),
+  // ticks start louder, siren on shorter fuse (handled by game layer).
+  let _exposedParked = false;
+
+  function setExposedParkState(parked) {
+    if (!ctx) return;
+    _exposedParked = parked;
+
+    if (parked) {
+      // Engine stays on at idle — don't fade it out. Just pull back slightly.
+      if (engineGain) engineGain.gain.linearRampToValueAtTime(0.08, ctx.currentTime + 0.15);
+
+      // Porno music OFF — silence is the danger cue
+      stopPornoMusic();
+
+      // Rumble immediately at high gain regardless of cop distance
+      if (rumbleGain) rumbleGain.gain.linearRampToValueAtTime(0.12, ctx.currentTime + 0.1);
+
+      // Aggressive ticks from the start — already elevated
+      _tickStep = 3; // start mid-escalation
+      tickInterval = tickInterval || setInterval(() => {
+        if (!ctx) return;
+        _tickStep++;
+        const freq = Math.min(2400, 1200 + _tickStep * 80);
+        const bufLen = Math.floor(ctx.sampleRate * 0.02);
+        const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < bufLen; i++) d[i] = (Math.random()*2-1) * Math.exp(-i/(bufLen*0.15));
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const f = ctx.createBiquadFilter();
+        f.type = 'bandpass';
+        f.frequency.setValueAtTime(freq, ctx.currentTime);
+        f.Q.setValueAtTime(4, ctx.currentTime);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.18 + _tickStep * 0.015, ctx.currentTime); // louder than hidden
+        src.connect(f); f.connect(g); g.connect(masterGain);
+        src.start(); src.stop(ctx.currentTime + 0.025);
+      }, 1000);
+
+    } else {
+      // Leaving exposed park
+      _exposedParked = false;
+      if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+      _tickStep = 0;
+
+      // Rumble back to proximity-driven
+      if (rumbleGain) rumbleGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.3);
+
+      // Porno music back
+      startPornoMusic();
+
+      // Engine restore
+      if (engineGain) {
+        const targetVol = 0.10 + 0.12 * _engineSpeed;
+        engineGain.gain.linearRampToValueAtTime(targetVol, ctx.currentTime + 0.2);
       }
     }
   }
@@ -757,7 +815,7 @@ const Audio = (() => {
     });
   }
 
-  return { init, setEngineSpeed, playPickup, playDropoff, playBust, playTransactionComplete, setCopSiren, startAmbience, startPornoMusic, stopPornoMusic, setParkState, setCopProximity, setCopSearchState };
+  return { init, setEngineSpeed, playPickup, playDropoff, playBust, playTransactionComplete, setCopSiren, startAmbience, startPornoMusic, stopPornoMusic, setParkState, setExposedParkState, setCopProximity, setCopSearchState };
 })();
 
 </script>
@@ -855,6 +913,9 @@ let parkTimerRemaining = 0;
 let dropoffEarnings    = 0;
 let nearCopWarningTimer = 0;
 let nearestCopDist     = 999;
+let heatPoints         = 0;
+let cleanTimer         = 0;  // seconds of clean driving (no cop in CHASE)
+let pickupTime         = 0;
 
 const keys = {};
 const STATE = { INTRO: 'INTRO', PLAYING: 'PLAYING', BUSTED: 'BUSTED' };
@@ -891,9 +952,10 @@ window.NearestCopDistance = 999; // live px
 window.CopModes           = [];  // live array: cops.map(c => c.mode)
 
 window.GameState = {
-  get parked()      { return isParked; },
-  get parkTimer()   { return parkTimerRemaining; },
-  get workerInCar() { return workerInCar; },
+  get parked()       { return isParked; },
+  get parkTimer()    { return parkTimerRemaining; },
+  get workerInCar()  { return workerInCar; },
+  get parkExposed()  { return gamePhase === 'EXPOSED_PARK'; },
 };
 
 // ─── Tile Helpers ───────────────────────────────────────────────────────────
@@ -1203,10 +1265,7 @@ function spawnCops(targetCount) {
 }
 
 function updateWanted() {
-  let lvl = 0;
-  for (let i = 0; i < STAR_THRESHOLDS.length; i++) {
-    if (dropoffs >= STAR_THRESHOLDS[i]) lvl = i + 1;
-  }
+  const lvl = heatPoints >= 6 ? 3 : heatPoints >= 3 ? 2 : heatPoints > 0 ? 1 : 0;
   if (lvl !== wantedLevel) {
     wantedLevel = lvl;
     Audio.setCopSiren(wantedLevel);
@@ -1248,6 +1307,9 @@ function initGame() {
   dropoffEarnings     = 0;
   nearCopWarningTimer = 0;
   nearestCopDist      = 999;
+  heatPoints          = 0;
+  cleanTimer          = 0;
+  pickupTime          = 0;
 
   window.NearestCopDistance = 999;
   window.CopModes           = [];
@@ -1320,6 +1382,7 @@ function update() {
       if (dist(Player.x, Player.y, workers[i].x, workers[i].y) < WORKER_PICKUP_RADIUS) {
         workers.splice(i, 1);
         workerInCar = true;
+        pickupTime  = Date.now();
         gamePhase   = PHASE.HAS_WORKER;
         Audio.playPickup();
         break;
@@ -1361,14 +1424,19 @@ function update() {
       workerInCar = false;
       gamePhase   = PHASE.DROPOFF;
       Audio.setParkState(false);
-      dropoffEarnings = MIN_EARNINGS + Math.floor(Math.random() * (MAX_EARNINGS - MIN_EARNINGS + 1));
+      dropoffEarnings = 15; // placeholder; final calc at drop-off
       dropoffPos  = randomRoadPosBetween(Player.x, Player.y, DROPOFF_MIN_DIST, DROPOFF_MAX_DIST);
     }
 
   } else if (gamePhase === PHASE.DROPOFF) {
     if (dropoffPos && dist(Player.x, Player.y, dropoffPos.x, dropoffPos.y) < DROP_RADIUS) {
+      const elapsed = (Date.now() - pickupTime) / 1000;
+      const speedBonus = Math.max(-15, Math.min(30, Math.round(30 - elapsed)));
+      dropoffEarnings = 15 + Math.max(0, speedBonus);
       earnings  += dropoffEarnings;
       dropoffs++;
+      heatPoints = Math.max(0, heatPoints - 1);
+      cleanTimer = 0;
       Audio.playDropoff(dropoffEarnings);
       dropoffPos = null;
       gamePhase  = PHASE.FIND_WORKER;
@@ -1425,11 +1493,13 @@ function update() {
     } else if (cop.mode === 'SEARCH') {
       // Can re-enter CHASE if player is visible (worker in car, not parked, close)
       if (!isParked && workerInCar && pd < COP_CHASE_RADIUS) {
+        if (cop.mode !== 'CHASE') { heatPoints++; cleanTimer = 0; updateWanted(); }
         cop.mode = 'CHASE';
       }
     } else {
       // PATROL: can enter CHASE only if player is visible (not parked, worker in car)
       if (!isParked && workerInCar && pd < COP_CHASE_RADIUS) {
+        if (cop.mode !== 'CHASE') { heatPoints++; cleanTimer = 0; updateWanted(); }
         cop.mode = 'CHASE';
       }
     }
@@ -1520,6 +1590,16 @@ function update() {
   }
 
   window.NearestCopDistance = nearestCopDist;
+
+  // Heat decay: 30s clean driving removes 1 heat point
+  const anyCopChasing = cops.some(c => c.mode === 'CHASE');
+  if (!anyCopChasing && heatPoints > 0) {
+    cleanTimer += 1/60;
+    if (cleanTimer >= 30) { heatPoints = Math.max(0, heatPoints - 1); cleanTimer = 0; updateWanted(); }
+  } else if (anyCopChasing) {
+    cleanTimer = 0;
+  }
+
   Audio.setCopProximity(nearestCopDist);
   updateCopExports();
 
@@ -1801,7 +1881,7 @@ function drawParkCountdown(screenX, screenY) {
   ctx.font         = 'bold 11px monospace';
   ctx.textAlign    = 'center';
   ctx.textBaseline = 'middle';
-  const _fi = Math.min(5, Math.ceil(parkTimerRemaining)); ctx.font = "bold 9px monospace"; ctx.fillText(PARK_FLAVOR[_fi], screenX, screenY);
+  ctx.fillText(Math.ceil(parkTimerRemaining) + 's', screenX, screenY);
   ctx.textBaseline = 'alphabetic';
   ctx.restore();
 }
