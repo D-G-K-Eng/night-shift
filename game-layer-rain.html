@@ -1,0 +1,2702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NIGHT SHIFT</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a12;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: monospace;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    filter: contrast(1.1) brightness(0.92) saturate(1.15);
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script>
+'use strict';
+
+// ─── Audio Engine (Hammerz) ────────────────────────────────────────────────
+// Synthwave procedural audio. All Web Audio API — no samples.
+//
+// Public API (matches Viv's stubs exactly):
+//   Audio.init()                    — call on first user gesture
+//   Audio.setEngineSpeed(0-1)       — call every frame
+//   Audio.playPickup()              — fare picked up
+//   Audio.playDropoff(earnings)     — fare dropped off, earnings = $ amount
+//   Audio.setCopSiren(wantedLevel)  — 0-3, 0 = off
+//   Audio.startAmbience()           — call once on game start
+// ──────────────────────────────────────────────────────────────────────────
+
+const Audio = (() => {
+  let ctx = null;
+
+  // Master output gain
+  let masterGain = null;
+
+  // ── Engine sound ────────────────────────────────────────────────────────
+  // Two detuned oscillators + filter, frequency mapped to speed.
+  let engineOsc1 = null, engineOsc2 = null;
+  let engineFilter = null, engineGain = null;
+  let _engineSpeed = 0;
+
+  const ENGINE_IDLE_FREQ = 80;
+  const ENGINE_MAX_FREQ  = 320;
+  const ENGINE_DETUNE    = 7; // cents of detuning between the two oscs
+
+  // ── City ambience ────────────────────────────────────────────────────────
+  // Low bass pad + filtered noise (city hiss) — always running
+  let ambienceRunning = false;
+  let noiseSrc = null, noiseFilter = null, noiseGain = null;
+  let bassPad = null, bassPadGain = null;
+
+  // ── Cop siren ────────────────────────────────────────────────────────────
+  // Two-tone alternating American siren, rate scales with wanted level
+  let sirenOsc = null, sirenGain = null;
+  let sirenInterval = null;
+  let sirenToggle = false;
+  let _wantedLevel = 0;
+
+  const SIREN_FREQ_HI = 960;
+  const SIREN_FREQ_LO = 770;
+  const SIREN_RATES = [0, 800, 600, 350]; // ms per toggle per star level
+
+  // ── Wanted level ambience layers ─────────────────────────────────────────
+  // One looping synth loop, layers unmuted as stars increase.
+  // Layer 0: bass (always on when game running)
+  // Layer 1: hi-hat (star 2+)
+  // Layer 2: lead stab (star 3)
+  const wantedLayers = [];
+
+  // ─── Init ───────────────────────────────────────────────────────────────
+  function init() {
+    if (ctx) return;
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+    masterGain = ctx.createGain();
+    masterGain.gain.setValueAtTime(0.8, ctx.currentTime);
+    masterGain.connect(ctx.destination);
+
+    _buildEngine();
+    _buildSiren();
+    _buildProximityRumble();
+    _buildSearchState();
+    _buildWantedLayers();
+  }
+
+  // ─── Engine ─────────────────────────────────────────────────────────────
+  function _buildEngine() {
+    engineFilter = ctx.createBiquadFilter();
+    engineFilter.type = 'lowpass';
+    engineFilter.frequency.setValueAtTime(400, ctx.currentTime);
+    engineFilter.Q.setValueAtTime(2, ctx.currentTime);
+
+    engineGain = ctx.createGain();
+    engineGain.gain.setValueAtTime(0.18, ctx.currentTime);
+
+    engineOsc1 = ctx.createOscillator();
+    engineOsc1.type = 'sawtooth';
+    engineOsc1.frequency.setValueAtTime(ENGINE_IDLE_FREQ, ctx.currentTime);
+    engineOsc1.detune.setValueAtTime(ENGINE_DETUNE, ctx.currentTime);
+
+    engineOsc2 = ctx.createOscillator();
+    engineOsc2.type = 'sawtooth';
+    engineOsc2.frequency.setValueAtTime(ENGINE_IDLE_FREQ, ctx.currentTime);
+    engineOsc2.detune.setValueAtTime(-ENGINE_DETUNE, ctx.currentTime);
+
+    engineOsc1.connect(engineFilter);
+    engineOsc2.connect(engineFilter);
+    engineFilter.connect(engineGain);
+    engineGain.connect(masterGain);
+
+    engineOsc1.start();
+    engineOsc2.start();
+  }
+
+  function setEngineSpeed(norm) {
+    if (!ctx) return;
+    _engineSpeed = norm;
+    const freq = ENGINE_IDLE_FREQ + (ENGINE_MAX_FREQ - ENGINE_IDLE_FREQ) * norm;
+    const ramp = ctx.currentTime + 0.05; // slew
+    engineOsc1.frequency.linearRampToValueAtTime(freq, ramp);
+    engineOsc2.frequency.linearRampToValueAtTime(freq, ramp);
+    // Filter opens with speed
+    engineFilter.frequency.linearRampToValueAtTime(200 + 1800 * norm, ramp);
+    // Volume up slightly at speed
+    engineGain.gain.linearRampToValueAtTime(0.10 + 0.12 * norm, ramp);
+  }
+
+  // ─── Ambience ────────────────────────────────────────────────────────────
+  function startAmbience() {
+    if (!ctx || ambienceRunning) return;
+    ambienceRunning = true;
+
+    // City hiss — filtered white noise
+    const bufLen = ctx.sampleRate * 2;
+    const noiseBuffer = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+
+    noiseSrc = ctx.createBufferSource();
+    noiseSrc.buffer = noiseBuffer;
+    noiseSrc.loop = true;
+
+    noiseFilter = ctx.createBiquadFilter();
+    noiseFilter.type = 'bandpass';
+    noiseFilter.frequency.setValueAtTime(800, ctx.currentTime);
+    noiseFilter.Q.setValueAtTime(0.4, ctx.currentTime);
+
+    noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.04, ctx.currentTime);
+
+    noiseSrc.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(masterGain);
+    noiseSrc.start();
+
+    // Bass pad — deep sine drone, slow LFO swell
+    bassPad = ctx.createOscillator();
+    bassPad.type = 'sine';
+    bassPad.frequency.setValueAtTime(55, ctx.currentTime); // A1
+
+    const lfo = ctx.createOscillator();
+    lfo.frequency.setValueAtTime(0.12, ctx.currentTime);
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.setValueAtTime(0.03, ctx.currentTime);
+    lfo.connect(lfoGain);
+
+    bassPadGain = ctx.createGain();
+    bassPadGain.gain.setValueAtTime(0, ctx.currentTime);
+    bassPadGain.gain.linearRampToValueAtTime(0.22, ctx.currentTime + 2); // fade in
+
+    lfoGain.connect(bassPadGain.gain);
+    bassPad.connect(bassPadGain);
+    bassPadGain.connect(masterGain);
+    bassPad.start();
+    lfo.start();
+
+    // Start 70s porno music layer
+    startPornoMusic();
+
+    // Poll CopModes each frame to drive search-state audio
+    _driveCopSearchAudio();
+  }
+
+  // ─── Siren ───────────────────────────────────────────────────────────────
+  function _buildSiren() {
+    sirenOsc = ctx.createOscillator();
+    sirenOsc.type = 'square';
+    sirenOsc.frequency.setValueAtTime(SIREN_FREQ_HI, ctx.currentTime);
+
+    // Siren filter to soften the square a bit
+    const sirenFilter = ctx.createBiquadFilter();
+    sirenFilter.type = 'lowpass';
+    sirenFilter.frequency.setValueAtTime(2000, ctx.currentTime);
+
+    sirenGain = ctx.createGain();
+    sirenGain.gain.setValueAtTime(0, ctx.currentTime); // starts silent
+
+    sirenOsc.connect(sirenFilter);
+    sirenFilter.connect(sirenGain);
+    sirenGain.connect(masterGain);
+    sirenOsc.start();
+  }
+
+  function setCopSiren(level) {
+    if (!ctx) return;
+    _wantedLevel = level;
+
+    // Clear existing interval
+    if (sirenInterval) { clearInterval(sirenInterval); sirenInterval = null; }
+
+    if (level === 0) {
+      sirenGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.3);
+      return;
+    }
+
+    const rate = SIREN_RATES[level];
+    sirenGain.gain.linearRampToValueAtTime(0.15 + 0.05 * level, ctx.currentTime + 0.1);
+
+    sirenInterval = setInterval(() => {
+      if (!ctx) return;
+      sirenToggle = !sirenToggle;
+      sirenOsc.frequency.setValueAtTime(
+        sirenToggle ? SIREN_FREQ_HI : SIREN_FREQ_LO,
+        ctx.currentTime
+      );
+    }, rate);
+
+    // Update wanted layer volumes
+    _setWantedLayerLevels(level);
+  }
+
+  // ─── Wanted Level Layers ─────────────────────────────────────────────────
+  // Procedural rhythmic loop built from oscillators + noise bursts.
+  // Each "layer" is a looping pattern driven by setInterval scheduling.
+  // Layer 0: bass pulse (always on in game)
+  // Layer 1: hi-hat tick (star 2+)
+  // Layer 2: stab chord (star 3)
+
+  function _buildWantedLayers() {
+    // Layer 0 — bass pulse: low sine bursts at ~120 BPM (500ms interval)
+    const bassGain = ctx.createGain();
+    bassGain.gain.setValueAtTime(0, ctx.currentTime);
+    bassGain.connect(masterGain);
+
+    let bassInterval = null;
+    function startBass() {
+      if (bassInterval) return;
+      bassInterval = setInterval(() => {
+        if (!ctx) return;
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(55, ctx.currentTime);
+        g.gain.setValueAtTime(0.0, ctx.currentTime);
+        g.gain.linearRampToValueAtTime(0.25, ctx.currentTime + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+        osc.connect(g); g.connect(masterGain);
+        osc.start(); osc.stop(ctx.currentTime + 0.4);
+      }, 500);
+    }
+
+    // Layer 1 — hi-hat: filtered noise burst at 240 BPM (250ms interval)
+    let hatInterval = null;
+    function startHat() {
+      if (hatInterval) return;
+      hatInterval = setInterval(() => {
+        if (!ctx) return;
+        const bufLen = Math.floor(ctx.sampleRate * 0.05);
+        const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < bufLen; i++) d[i] = Math.random() * 2 - 1;
+
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const f = ctx.createBiquadFilter();
+        f.type = 'highpass';
+        f.frequency.setValueAtTime(8000, ctx.currentTime);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.08, ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.04);
+        src.connect(f); f.connect(g); g.connect(masterGain);
+        src.start(); src.stop(ctx.currentTime + 0.05);
+      }, 250);
+    }
+
+    // Layer 2 — stab: quick detuned chord hit every beat
+    let stabInterval = null;
+    function startStab() {
+      if (stabInterval) return;
+      const STAB_FREQS = [110, 138.6, 165]; // A2, C#3, E3 — minor chord
+      stabInterval = setInterval(() => {
+        if (!ctx) return;
+        STAB_FREQS.forEach((freq, i) => {
+          const osc = ctx.createOscillator();
+          const g = ctx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(freq, ctx.currentTime);
+          osc.detune.setValueAtTime((i - 1) * 5, ctx.currentTime);
+          g.gain.setValueAtTime(0.0, ctx.currentTime);
+          g.gain.linearRampToValueAtTime(0.06, ctx.currentTime + 0.01);
+          g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+          osc.connect(g); g.connect(masterGain);
+          osc.start(); osc.stop(ctx.currentTime + 0.2);
+        });
+      }, 500);
+    }
+
+    wantedLayers.push(
+      { start: startBass,  stop: () => { clearInterval(bassInterval); bassInterval = null; }, minStar: 1 },
+      { start: startHat,   stop: () => { clearInterval(hatInterval);  hatInterval  = null; }, minStar: 2 },
+      { start: startStab,  stop: () => { clearInterval(stabInterval); stabInterval = null; }, minStar: 3 },
+    );
+  }
+
+  function _setWantedLayerLevels(level) {
+    for (const layer of wantedLayers) {
+      if (level >= layer.minStar) {
+        layer.start();
+      } else {
+        layer.stop();
+      }
+    }
+  }
+
+  // ─── Cop Search State Audio ───────────────────────────────────────────────
+  // Plays when a cop enters "search sweep" mode after losing sight of the player.
+  // Distinct from siren (spotted) and patrol (safe) — the "hunting" middle state.
+  // Sound: slow LFO sweep on a low sine band (80-180Hz), 3s cycle.
+  // Call: Audio.setCopSearchState(true/false)
+  let searchOsc = null, searchLFO = null, searchGain = null;
+  let _searching = false;
+
+  function _buildSearchState() {
+    // Base tone — mid-low sine, amplitude modulated by LFO
+    searchOsc = ctx.createOscillator();
+    searchOsc.type = 'sine';
+    searchOsc.frequency.setValueAtTime(110, ctx.currentTime); // A2
+
+    // LFO sweeps the filter frequency (80-180Hz range) — slow, ominous
+    searchLFO = ctx.createOscillator();
+    searchLFO.type = 'sine';
+    searchLFO.frequency.setValueAtTime(0.33, ctx.currentTime); // 3s cycle
+
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.setValueAtTime(50, ctx.currentTime); // ±50Hz sweep on the base freq
+    searchLFO.connect(lfoGain);
+    lfoGain.connect(searchOsc.frequency);
+
+    searchGain = ctx.createGain();
+    searchGain.gain.setValueAtTime(0, ctx.currentTime); // silent until activated
+
+    searchOsc.connect(searchGain);
+    searchGain.connect(masterGain);
+    searchOsc.start();
+    searchLFO.start();
+  }
+
+  // Poll window.CopModes every frame — drive search audio automatically
+  function _driveCopSearchAudio() {
+    let _lastSearchState = false;
+    function frame() {
+      if (!ctx) { requestAnimationFrame(frame); return; }
+      const modes = window.CopModes;
+      const anySearching = Array.isArray(modes) && modes.some(m => m === 'SEARCH');
+      if (anySearching !== _lastSearchState) {
+        _lastSearchState = anySearching;
+        setCopSearchState(anySearching);
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function setCopSearchState(active) {
+    if (!ctx || !searchGain) return;
+    _searching = active;
+    if (active) {
+      // Fade in slowly — the threat materialises
+      searchGain.gain.linearRampToValueAtTime(0.09, ctx.currentTime + 1.2);
+    } else {
+      // Fade out — they've given up, back to patrol
+      searchGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 2.5);
+    }
+  }
+
+  // ─── Park State (tension while parked) ───────────────────────────────────
+  let _parked = false;
+  let tensionOsc = null, tensionGain = null;
+  let tickInterval = null;
+  let _tickStep = 0;
+
+  // Sub-bass rumble for cop proximity (always running, gain driven by distance)
+  let rumbleOsc = null, rumbleGain = null;
+
+  function _buildProximityRumble() {
+    rumbleOsc = ctx.createOscillator();
+    rumbleOsc.type = 'sine';
+    rumbleOsc.frequency.setValueAtTime(42, ctx.currentTime); // below conscious hearing, felt
+
+    // Slight LFO flutter to make it feel organic
+    const lfo = ctx.createOscillator();
+    lfo.frequency.setValueAtTime(4.5, ctx.currentTime);
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.setValueAtTime(3, ctx.currentTime);
+    lfo.connect(lfoGain);
+    lfoGain.connect(rumbleOsc.frequency);
+    lfo.start();
+
+    rumbleGain = ctx.createGain();
+    rumbleGain.gain.setValueAtTime(0, ctx.currentTime);
+    rumbleOsc.connect(rumbleGain);
+    rumbleGain.connect(masterGain);
+    rumbleOsc.start();
+  }
+
+  function setCopProximity(dist) {
+    if (!ctx || !rumbleGain) return;
+    // Audible from 150px, peaks at 0.15 gain on contact
+    const gain = Math.max(0, 1 - dist / 150) * 0.15;
+    rumbleGain.gain.linearRampToValueAtTime(gain, ctx.currentTime + 0.08);
+  }
+
+  function setParkState(parked) {
+    if (!ctx) return;
+    _parked = parked;
+
+    if (parked) {
+      // Engine off — fast fade
+      if (engineGain) engineGain.gain.linearRampToValueAtTime(0.01, ctx.currentTime + 0.2);
+
+      // Heartbeat tension: 60 BPM sine pulse — builds in amplitude over time
+      tensionOsc = ctx.createOscillator();
+      tensionOsc.type = 'sine';
+      tensionOsc.frequency.setValueAtTime(55, ctx.currentTime); // low A1
+
+      tensionGain = ctx.createGain();
+      tensionGain.gain.setValueAtTime(0, ctx.currentTime);
+      tensionGain.gain.linearRampToValueAtTime(0.12, ctx.currentTime + 3); // swell over 3s
+
+      tensionOsc.connect(tensionGain);
+      tensionGain.connect(masterGain);
+      tensionOsc.start();
+
+      // Timer ticks — 1 per second, pitch rises as timer runs down
+      _tickStep = 0;
+      tickInterval = setInterval(() => {
+        if (!ctx) return;
+        _tickStep++;
+        const freq = Math.min(2400, 1200 + _tickStep * 80);
+        const bufLen = Math.floor(ctx.sampleRate * 0.02);
+        const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < bufLen; i++) d[i] = (Math.random()*2-1) * Math.exp(-i/(bufLen*0.15));
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const f = ctx.createBiquadFilter();
+        f.type = 'bandpass';
+        f.frequency.setValueAtTime(freq, ctx.currentTime);
+        f.Q.setValueAtTime(4, ctx.currentTime);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.12 + _tickStep * 0.01, ctx.currentTime);
+        src.connect(f); f.connect(g); g.connect(masterGain);
+        src.start(); src.stop(ctx.currentTime + 0.025);
+      }, 1000);
+
+    } else {
+      // Leaving park — stop tension sounds, restore engine
+      if (tensionOsc) { try { tensionOsc.stop(); } catch(e) {} tensionOsc = null; }
+      if (tensionGain) { tensionGain.disconnect(); tensionGain = null; }
+      if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+      _tickStep = 0;
+
+      if (engineGain) {
+        const targetVol = 0.10 + 0.12 * _engineSpeed;
+        engineGain.gain.linearRampToValueAtTime(targetVol, ctx.currentTime + 0.3);
+      }
+    }
+  }
+
+  // Exposed parking — parked on a road tile, cops can still spot you.
+  // Audio arc: engine stays at idle (no fadeout), no heartbeat tension,
+  // rumble immediately hot, porno music cuts (silence = danger cue),
+  // ticks start louder, siren on shorter fuse (handled by game layer).
+  let _exposedParked = false;
+
+  function setExposedParkState(parked) {
+    if (!ctx) return;
+    _exposedParked = parked;
+
+    if (parked) {
+      // Engine stays on at idle — don't fade it out. Just pull back slightly.
+      if (engineGain) engineGain.gain.linearRampToValueAtTime(0.08, ctx.currentTime + 0.15);
+
+      // Porno music OFF — silence is the danger cue
+      stopPornoMusic();
+
+      // Rumble immediately at high gain regardless of cop distance
+      if (rumbleGain) rumbleGain.gain.linearRampToValueAtTime(0.12, ctx.currentTime + 0.1);
+
+      // Aggressive ticks from the start — already elevated
+      _tickStep = 3; // start mid-escalation
+      tickInterval = tickInterval || setInterval(() => {
+        if (!ctx) return;
+        _tickStep++;
+        const freq = Math.min(2400, 1200 + _tickStep * 80);
+        const bufLen = Math.floor(ctx.sampleRate * 0.02);
+        const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < bufLen; i++) d[i] = (Math.random()*2-1) * Math.exp(-i/(bufLen*0.15));
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const f = ctx.createBiquadFilter();
+        f.type = 'bandpass';
+        f.frequency.setValueAtTime(freq, ctx.currentTime);
+        f.Q.setValueAtTime(4, ctx.currentTime);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.18 + _tickStep * 0.015, ctx.currentTime); // louder than hidden
+        src.connect(f); f.connect(g); g.connect(masterGain);
+        src.start(); src.stop(ctx.currentTime + 0.025);
+      }, 1000);
+
+    } else {
+      // Leaving exposed park
+      _exposedParked = false;
+      if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+      _tickStep = 0;
+
+      // Rumble back to proximity-driven
+      if (rumbleGain) rumbleGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.3);
+
+      // Porno music back
+      startPornoMusic();
+
+      // Engine restore
+      if (engineGain) {
+        const targetVol = 0.10 + 0.12 * _engineSpeed;
+        engineGain.gain.linearRampToValueAtTime(targetVol, ctx.currentTime + 0.2);
+      }
+    }
+  }
+
+  // ─── 70s Porno Music Layer ────────────────────────────────────────────────
+  // Wah guitar + walking bass + sleazy brass stabs. All procedural Web Audio.
+  // Runs as a looping pattern on top of city ambience.
+  // BPM: 100 (600ms per beat, 300ms per 8th note)
+  //
+  // Elements:
+  //   Walking bass: Eb2 pentatonic pattern, fingered-bass tone (sawtooth + LP filter)
+  //   Wah guitar:   sawtooth osc through sweeping bandpass filter (auto-wah envelope)
+  //   Brass stab:   two-voice sawtooth chord hit, short envelope, slight detuning
+  let pornoRunning = false;
+  let pornoIntervals = [];
+  const PORNO_BPM = 100;
+  const PORNO_BEAT = 60000 / PORNO_BPM;  // ms per beat
+  const PORNO_8TH  = PORNO_BEAT / 2;
+
+  function startPornoMusic() {
+    if (!ctx || pornoRunning) return;
+    pornoRunning = true;
+
+    // ── Walking bass ────────────────────────────────────────────────────────
+    // Eb2 (77.78Hz) pentatonic root pattern: root, 5th, b7, root up
+    // repeating 4-note riff, one note per beat
+    const BASS_NOTES = [77.78, 116.54, 138.59, 155.56]; // Eb2, Bb2, Db3, Eb3
+    let bassStep = 0;
+    pornoIntervals.push(setInterval(() => {
+      if (!ctx) return;
+      const freq = BASS_NOTES[bassStep % BASS_NOTES.length];
+      bassStep++;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+
+      // Finger-bass tone: sharp LP filter, slight resonance
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'lowpass';
+      filt.frequency.setValueAtTime(600, ctx.currentTime);
+      filt.frequency.exponentialRampToValueAtTime(200, ctx.currentTime + 0.18);
+      filt.Q.setValueAtTime(3, ctx.currentTime);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0, ctx.currentTime);
+      g.gain.linearRampToValueAtTime(0.28, ctx.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
+
+      osc.connect(filt); filt.connect(g); g.connect(masterGain);
+      osc.start(); osc.stop(ctx.currentTime + 0.5);
+    }, PORNO_BEAT));
+
+    // ── Wah guitar ──────────────────────────────────────────────────────────
+    // Sawtooth through auto-wah bandpass — filter sweeps up on each hit.
+    // Fires on beats 2 and 4 (offbeat), classic funk rhythm guitar position.
+    let wahBeat = 0;
+    const WAH_CHORD = [155.56, 195.99, 233.08]; // Eb3, G3, Bb3 — Eb major
+    pornoIntervals.push(setInterval(() => {
+      wahBeat++;
+      if (wahBeat % 2 !== 0) return; // only on even beats (2, 4)
+      if (!ctx) return;
+
+      WAH_CHORD.forEach((freq, vi) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        osc.detune.setValueAtTime((vi - 1) * 8, ctx.currentTime);
+
+        // Auto-wah: bandpass sweeping 400→2200Hz in 0.12s then decay
+        const wah = ctx.createBiquadFilter();
+        wah.type = 'bandpass';
+        wah.Q.setValueAtTime(8, ctx.currentTime);
+        wah.frequency.setValueAtTime(400, ctx.currentTime);
+        wah.frequency.linearRampToValueAtTime(2200, ctx.currentTime + 0.12);
+        wah.frequency.exponentialRampToValueAtTime(400, ctx.currentTime + 0.35);
+
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, ctx.currentTime);
+        g.gain.linearRampToValueAtTime(0.10, ctx.currentTime + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
+
+        osc.connect(wah); wah.connect(g); g.connect(masterGain);
+        osc.start(); osc.stop(ctx.currentTime + 0.35);
+      });
+    }, PORNO_BEAT));
+
+    // ── Brass stab ──────────────────────────────────────────────────────────
+    // Short two-voice stab on beat 3 of every 2-bar phrase (every 8 beats).
+    // Eb major 7 chord voiced for sleazy brass feel.
+    let brassCount = 0;
+    const BRASS_VOICING = [
+      [233.08, 277.18],  // Bb3 + Db4
+      [311.13, 369.99],  // Eb4 + F#4 (slightly dissonant — exactly right)
+    ];
+    pornoIntervals.push(setInterval(() => {
+      brassCount++;
+      if (brassCount % 8 !== 3) return; // beat 3 of the 2-bar phrase
+      if (!ctx) return;
+
+      BRASS_VOICING.forEach(([f1, f2]) => {
+        [f1, f2].forEach((freq, vi) => {
+          const osc = ctx.createOscillator();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(freq, ctx.currentTime);
+          osc.detune.setValueAtTime(vi * 6, ctx.currentTime); // slight detune per voice
+
+          // Brass-ish tone: LP filter with a small resonance bump
+          const filt = ctx.createBiquadFilter();
+          filt.type = 'lowpass';
+          filt.frequency.setValueAtTime(3000, ctx.currentTime);
+          filt.frequency.exponentialRampToValueAtTime(1200, ctx.currentTime + 0.1);
+          filt.Q.setValueAtTime(2, ctx.currentTime);
+
+          const g = ctx.createGain();
+          g.gain.setValueAtTime(0, ctx.currentTime);
+          g.gain.linearRampToValueAtTime(0.13, ctx.currentTime + 0.015); // punchy attack
+          g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
+
+          osc.connect(filt); filt.connect(g); g.connect(masterGain);
+          osc.start(); osc.stop(ctx.currentTime + 0.25);
+        });
+      });
+    }, PORNO_BEAT));
+  }
+
+  function stopPornoMusic() {
+    for (const id of pornoIntervals) clearInterval(id);
+    pornoIntervals = [];
+    pornoRunning = false;
+  }
+
+  // ─── Stings & Jingles ────────────────────────────────────────────────────
+  // All music-responsive cues — the porno music is now the narrator.
+
+  function playPickup() {
+    if (!ctx) return;
+    // Wah guitar stab on pickup — new client acquired. Professionally.
+    // Single chord hit (Eb maj) through auto-wah, punchy attack.
+    const CHORD = [155.56, 195.99, 233.08]; // Eb3, G3, Bb3
+    CHORD.forEach((freq, vi) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+      osc.detune.setValueAtTime((vi - 1) * 10, ctx.currentTime);
+
+      const wah = ctx.createBiquadFilter();
+      wah.type = 'bandpass';
+      wah.Q.setValueAtTime(10, ctx.currentTime);
+      wah.frequency.setValueAtTime(300, ctx.currentTime);
+      wah.frequency.linearRampToValueAtTime(2800, ctx.currentTime + 0.08);
+      wah.frequency.exponentialRampToValueAtTime(500, ctx.currentTime + 0.3);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, ctx.currentTime);
+      g.gain.linearRampToValueAtTime(0.14, ctx.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.32);
+
+      osc.connect(wah); wah.connect(g); g.connect(masterGain);
+      osc.start(); osc.stop(ctx.currentTime + 0.38);
+    });
+  }
+
+  function playDropoff(earningsAmt) {
+    if (!ctx) return;
+    // Triumphant horn fanfare — one measure, slightly ridiculous.
+    // Rising 4-note brass figure (Eb, G, Bb, Eb up) + cash register.
+    const FANFARE = [155.56, 195.99, 233.08, 311.13]; // Eb3→Eb4 major arp
+    FANFARE.forEach((freq, i) => {
+      const t = ctx.currentTime + i * 0.1;
+      // Two-voice brass
+      [freq, freq * 1.25].forEach((f, vi) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(f, t);
+        osc.detune.setValueAtTime(vi * 8, t);
+        const filt = ctx.createBiquadFilter();
+        filt.type = 'lowpass';
+        filt.frequency.setValueAtTime(2800, t);
+        filt.frequency.exponentialRampToValueAtTime(900, t + 0.18);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.10, t + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+        osc.connect(filt); filt.connect(g); g.connect(masterGain);
+        osc.start(t); osc.stop(t + 0.25);
+      });
+    });
+
+    // Cash register tick — the money is real
+    const t2 = ctx.currentTime + 0.45;
+    const bufLen = Math.floor(ctx.sampleRate * 0.03);
+    const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) d[i] = (Math.random()*2-1) * Math.exp(-i/(bufLen*0.3));
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const f = ctx.createBiquadFilter();
+    f.type = 'bandpass';
+    f.frequency.setValueAtTime(3000, t2);
+    f.Q.setValueAtTime(1, t2);
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.28, t2);
+    src.connect(f); f.connect(g2); g2.connect(masterGain);
+    src.start(t2); src.stop(t2 + 0.05);
+  }
+
+  // Sad trombone — bust screen. Service terminated. Regulatory intervention.
+  function playBust() {
+    if (!ctx) return;
+    // Three descending notes: Bb3, G3, Eb3 — slow, defeated, filtered cheap.
+    const NOTES = [233.08, 195.99, 155.56];
+    NOTES.forEach((freq, i) => {
+      const t = ctx.currentTime + i * 0.45;
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq * 1.02, t); // slight slide down
+      osc.frequency.linearRampToValueAtTime(freq * 0.97, t + 0.4);
+
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'lowpass';
+      filt.frequency.setValueAtTime(1200, t);
+      filt.frequency.linearRampToValueAtTime(500, t + 0.4);
+      filt.Q.setValueAtTime(3, t);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.2, t + 0.04);
+      g.gain.linearRampToValueAtTime(0.18, t + 0.3);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.44);
+
+      osc.connect(filt); filt.connect(g); g.connect(masterGain);
+      osc.start(t); osc.stop(t + 0.5);
+    });
+
+    // Stop porno music on bust — the silence is the punchline
+    stopPornoMusic();
+  }
+
+  // Transaction complete — park timer hit zero. Satisfied saxophone-ish phrase.
+  // Two-note resolution: Bb3 → Eb4. Smooth, smug.
+  function playTransactionComplete() {
+    if (!ctx) return;
+    [[233.08, 0], [311.13, 0.25]].forEach(([freq, delay]) => {
+      const t = ctx.currentTime + delay;
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq, t);
+
+      // Sax-ish: LP filter with slight resonance, slow attack
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'lowpass';
+      filt.frequency.setValueAtTime(1800, t);
+      filt.frequency.linearRampToValueAtTime(800, t + 0.3);
+      filt.Q.setValueAtTime(4, t);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.15, t + 0.06); // slow sax attack
+      g.gain.linearRampToValueAtTime(0.12, t + 0.25);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.45);
+
+      osc.connect(filt); filt.connect(g); g.connect(masterGain);
+      osc.start(t); osc.stop(t + 0.5);
+    });
+  }
+
+  return { init, setEngineSpeed, playPickup, playDropoff, playBust, playTransactionComplete, setCopSiren, startAmbience, startPornoMusic, stopPornoMusic, setParkState, setExposedParkState, setCopProximity, setCopSearchState };
+})();
+
+</script>
+
+<script>
+'use strict';
+
+'use strict';
+
+// Audio engine is defined in the first script block above
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+const CANVAS_W = 800;
+const CANVAS_H = 600;
+
+const TILE_SIZE  = 32;
+const CITY_TILES = 40;
+const CITY_SIZE  = CITY_TILES * TILE_SIZE; // 1280px
+
+const BLOCK_SIZE = 3;
+const ROAD_WIDTH = 2;
+const PERIOD     = BLOCK_SIZE + ROAD_WIDTH; // 5 tiles per period
+
+// Tile types
+const TILE = { ROAD: 0, BUILDING: 1, SIDEWALK: 2, HIDDEN_PARK: 3 };
+
+// Colors
+const COLOR = {
+  ROAD:        '#1a1a2e',
+  SIDEWALK:    '#2a2a3e',
+  HIDDEN_PARK: '#0d0d1a',
+  ROAD_MARK:   '#ffee00',
+  BG:          '#0a0a12',
+};
+const BUILDING_COLORS = ['#0d0d1a','#1a0d0d','#0d1a0d','#1a1a0d','#0d0d22','#22110d'];
+const NEON_COLORS     = ['#ff00aa','#00ffee','#aaff00','#ff6600','#ff0055'];
+
+// Car physics
+const CAR_W        = 16;
+const CAR_H        = 28;
+const MAX_SPEED    = 4.0;
+const ACCELERATION = 0.15;
+const FRICTION     = 0.92;
+const TURN_RATE    = 3;        // degrees per frame
+
+// Game rules
+const WORKER_PICKUP_RADIUS  = 20;
+const DROP_RADIUS           = 20;
+const COP_BUST_RADIUS       = 20;
+const COP_CHASE_RADIUS      = 80;   // cop switches to CHASE within this dist (worker in car)
+const COP_NEAR_PARK_RADIUS  = 120;  // edge-flash when parked and cop this close
+const PARK_SPEED_THRESHOLD  = 0.3;
+const PARK_TIMER_DURATION   = 5;    // seconds (hidden park)
+const EXPOSED_PARK_TIMER    = 3;    // seconds (exposed park on road)
+const EXPOSED_PARK_BONUS    = 15;   // extra $ for exposed park risk
+const COP_PATROL_SPEED      = 1.5;
+const COP_CHASE_SPEED       = 2.8;
+const COP_SEARCH_SPEED      = 2.0;
+const PATROL_REACH          = 16;   // px to advance patrol index
+const DROPOFF_MIN_DIST      = 50;
+const DROPOFF_MAX_DIST      = 200;
+const BASE_EARNINGS         = 15;
+const SPEED_BONUS_TARGET    = 45;   // seconds — under = bonus, over = penalty
+const SPEED_BONUS_MAX       = 30;   // max bonus dollars
+const MIN_PAYOUT            = 10;   // floor after penalty
+const COP_SPAWN_DIST        = 300;
+const INITIAL_COP_COUNT     = 2;
+const MAX_STARS             = 3;
+
+// Heat system constants
+const HEAT_DECAY_CLEAN_TIME = 30;   // seconds without being spotted to lose 1 heat
+const HEAT_STAR_THRESHOLDS  = [1, 3, 6]; // heat points for 1/2/3 stars
+
+// Game phases
+const PHASE = {
+  FIND_WORKER:  'FIND_WORKER',   // looking for worker on sidewalk
+  HAS_WORKER:   'HAS_WORKER',    // worker in car, find hidden park
+  PARKED:       'PARKED',        // at hidden park, timer running
+  EXPOSED_PARK: 'EXPOSED_PARK',  // at road tile, timer running (no cop immunity)
+  DROPOFF:      'DROPOFF',       // drive to drop-off tile
+};
+
+// ─── State ─────────────────────────────────────────────────────────────────
+let canvas, ctx;
+let map, blockColors, neonSigns, windows;
+let hiddenParks = [];  // [{tx, ty, wx, wy}]
+
+const Player = { x: 0, y: 0, vx: 0, vy: 0, angle: 0, speed: 0 };
+
+let rainDrops = [];
+const RAIN_COUNT  = 180;
+const RAIN_SPEED  = 6;
+const RAIN_ANGLE  = 10;  // degrees from vertical
+
+let workers    = [];   // [{x,y}] sidewalk waypoints
+let dropoffPos = null; // {x,y} road tile for drop-off
+let earnings   = 0;
+let dropoffs   = 0;
+let wantedLevel = 0;
+let cops       = [];   // full cop objects
+let pulse      = 0;
+
+let gamePhase          = PHASE.FIND_WORKER;
+let workerInCar        = false;
+let isParked           = false;
+let parkTimerEnd       = 0;
+let parkTimerRemaining = 0;
+let dropoffEarnings    = 0;
+let nearCopWarningTimer = 0;
+let nearestCopDist     = 999;
+
+// v2: Heat system state
+let heatPoints    = 0;
+let cleanTimer    = 0;    // seconds without being spotted
+let lastCleanTime = 0;    // Date.now() when clean streak started
+
+// v2: Speed bonus tracking
+let pickupTime = 0;       // Date.now() when worker entered car
+
+// v2: Exposed park state
+let isExposedParked       = false;
+let exposedParkBonusFlash = 0;  // frames to show "+$15" flash
+
+// v2: First-run onboarding
+let hasParkedOnce = false;
+
+// v2: Dropoff breakdown display
+let dropoffBreakdownTimer = 0;
+let dropoffBreakdownText  = '';
+
+const keys = {};
+const STATE = { INTRO: 'INTRO', PLAYING: 'PLAYING', BUSTED: 'BUSTED' };
+
+// Park countdown flavor text (indexed by Math.ceil(seconds remaining), clamped 0-5)
+const PARK_FLAVOR = [
+  '✓ Services rendered.',       // 0s
+  'Checking hair in mirror...', // 1s
+  'Wrapping up...',             // 2s
+  'Delivering value...',        // 3s
+  'Providing services...',      // 4s
+  'Consulting...',              // 5s
+];
+
+// Client name roster — assigned round-robin on worker spawn
+const CLIENT_NAMES = ['ROXANNE', 'DESTINY', 'BRENDA (ACCTG)', 'MR. CHEN', 'THE GUY'];
+let clientNameIndex = 0;
+
+let gameState    = STATE.INTRO;
+let bustFlash    = 0;
+let audioStarted = false;
+
+// ─── Exports for audio engine ───────────────────────────────────────────────
+window.TILE    = TILE;
+window.getTile = function(worldX, worldY) {
+  const tx = Math.floor(worldX / TILE_SIZE);
+  const ty = Math.floor(worldY / TILE_SIZE);
+  if (tx < 0 || ty < 0 || tx >= CITY_TILES || ty >= CITY_TILES) return TILE.BUILDING;
+  return map[ty][tx];
+};
+
+window.CopPatrolRoutes    = [];  // [[{x,y},...], ...] one per cop
+window.NearestCopDistance = 999; // live px
+window.CopModes           = [];  // live array: cops.map(c => c.mode)
+
+window.GameState = {
+  get parked()      { return isParked || isExposedParked; },
+  get parkTimer()   { return parkTimerRemaining; },
+  get workerInCar() { return workerInCar; },
+};
+
+// ─── Tile Helpers ───────────────────────────────────────────────────────────
+function isRoadCol(tileX) { return (tileX % PERIOD) < ROAD_WIDTH; }
+function isRoadRow(tileY) { return (tileY % PERIOD) < ROAD_WIDTH; }
+
+function tilePassable(tx, ty) {
+  if (tx < 0 || ty < 0 || tx >= CITY_TILES || ty >= CITY_TILES) return false;
+  const t = map[ty][tx];
+  return t === TILE.ROAD || t === TILE.HIDDEN_PARK;
+}
+
+function isSidewalkTile(tx, ty) {
+  if (tx < 0 || ty < 0 || tx >= CITY_TILES || ty >= CITY_TILES) return false;
+  return map[ty][tx] === TILE.SIDEWALK;
+}
+
+// ─── Map Generation ────────────────────────────────────────────────────────
+function generateMap() {
+  map = [];
+  for (let y = 0; y < CITY_TILES; y++) {
+    map[y] = [];
+    for (let x = 0; x < CITY_TILES; x++) {
+      const rX = isRoadCol(x), rY = isRoadRow(y);
+      if (rX || rY) {
+        map[y][x] = TILE.ROAD;
+      } else {
+        const adj = isRoadCol(x-1) || isRoadCol(x+1) || isRoadRow(y-1) || isRoadRow(y+1);
+        map[y][x] = adj ? TILE.SIDEWALK : TILE.BUILDING;
+      }
+    }
+  }
+
+  // ── Hidden park tiles (non-intersection corridor tiles) ──────────────────
+  const corridors = [];
+  for (let y = 2; y < CITY_TILES - 2; y++) {
+    for (let x = 2; x < CITY_TILES - 2; x++) {
+      if (map[y][x] === TILE.ROAD && !(isRoadCol(x) && isRoadRow(y))) {
+        corridors.push({ x, y });
+      }
+    }
+  }
+  // Seeded shuffle, pick 7
+  const rngH = mulberry32(555);
+  for (let i = corridors.length - 1; i > 0; i--) {
+    const j = Math.floor(rngH() * (i + 1));
+    [corridors[i], corridors[j]] = [corridors[j], corridors[i]];
+  }
+  hiddenParks = [];
+  for (const t of corridors.slice(0, 7)) {
+    map[t.y][t.x] = TILE.HIDDEN_PARK;
+    hiddenParks.push({
+      tx: t.x, ty: t.y,
+      wx: t.x * TILE_SIZE + TILE_SIZE / 2,
+      wy: t.y * TILE_SIZE + TILE_SIZE / 2,
+    });
+  }
+
+  // ── Block colors ─────────────────────────────────────────────────────────
+  blockColors = [];
+  for (let by = 0; by < CITY_TILES; by++) {
+    blockColors[by] = [];
+    for (let bx = 0; bx < CITY_TILES; bx++) {
+      const seed = Math.floor(by / PERIOD) * 100 + Math.floor(bx / PERIOD);
+      blockColors[by][bx] = BUILDING_COLORS[seed % BUILDING_COLORS.length];
+    }
+  }
+
+  // ── Pre-bake windows ─────────────────────────────────────────────────────
+  windows = [];
+  const rng = mulberry32(42);
+  for (let y = 0; y < CITY_TILES; y++) {
+    for (let x = 0; x < CITY_TILES; x++) {
+      if (map[y][x] !== TILE.BUILDING) continue;
+      for (let wy = 4; wy < TILE_SIZE - 4; wy += 6) {
+        for (let wx = 4; wx < TILE_SIZE - 4; wx += 6) {
+          if (rng() < 0.45) {
+            const tier = rng();
+            windows.push({
+              px: x*TILE_SIZE+wx, py: y*TILE_SIZE+wy,
+              bright: tier > 0.4,
+              flicker: tier < 0.2,
+              phase: rng() * Math.PI * 2,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // ── Neon signs ───────────────────────────────────────────────────────────
+  neonSigns = [];
+  const rng2 = mulberry32(99);
+  const NAMED_SIGNS = [
+    { label: 'VELVET LOUNGE',          color: '#ff00cc' },
+    { label: 'EXECUTIVE SUITES',       color: '#00ffee' },
+    { label: 'CLUB RENDEZVOUS',        color: '#ff44aa' },
+    { label: 'NOCTURNAL TRANSIT',      color: '#ff6600' },
+    { label: 'DISCREET SERVICES',      color: '#aa00ff' },
+    { label: 'AFTER DARK',             color: '#ff0033' },
+    { label: 'THE BACK NINE',          color: '#00ff66' },
+    { label: 'PREMIUM ACCOMMODATIONS', color: '#00eeff' },
+    { label: 'VACANCY',                color: '#ff2200' },
+    { label: 'ROOMS',                  color: '#ffee00' },
+    { label: 'TRENCHCOAT TAILORS',     color: '#9933ff' },
+    { label: '★ OPEN ★',              color: '#ff00aa' },
+    { label: '◈ LOUNGE ◈',            color: '#00ffaa' },
+    { label: '24HR',                   color: '#ffcc00' },
+    { label: 'LIVE MUSIC',             color: '#ff3388' },
+  ];
+  const cnt = 12 + Math.floor(rng2() * 7); // 12-18 signs
+  for (let i = 0; i < cnt; i++) {
+    let tx, ty, tries = 0;
+    do { tx = Math.floor(rng2() * CITY_TILES); ty = Math.floor(rng2() * CITY_TILES); tries++; }
+    while (map[ty][tx] !== TILE.BUILDING && tries < 300);
+    const def = NAMED_SIGNS[i % NAMED_SIGNS.length];
+    neonSigns.push({
+      px: tx*TILE_SIZE + 1,
+      py: ty*TILE_SIZE + 3,
+      w: TILE_SIZE - 2,
+      h: 12,
+      color: def.color,
+      label: def.label,
+    });
+  }
+}
+
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// ─── Position Helpers ────────────────────────────────────────────────────────
+function randomRoadPos() {
+  let tx, ty, tries = 0;
+  do {
+    tx = Math.floor(Math.random() * CITY_TILES);
+    ty = Math.floor(Math.random() * CITY_TILES);
+    tries++;
+  } while (!tilePassable(tx, ty) && tries < 500);
+  return { x: tx*TILE_SIZE + TILE_SIZE/2, y: ty*TILE_SIZE + TILE_SIZE/2 };
+}
+
+function randomRoadPosFarFrom(px, py, minDist) {
+  let pos, tries = 0;
+  do { pos = randomRoadPos(); tries++; }
+  while (dist(pos.x, pos.y, px, py) < minDist && tries < 200);
+  return pos;
+}
+
+function randomRoadPosNear(px, py, radius) {
+  // Pick a random road tile within `radius` px of (px, py)
+  let tries = 0;
+  while (tries < 200) {
+    const angle = Math.random() * Math.PI * 2;
+    const r     = 20 + Math.random() * radius;
+    const wx    = px + Math.cos(angle) * r;
+    const wy    = py + Math.sin(angle) * r;
+    const tx    = Math.floor(wx / TILE_SIZE);
+    const ty    = Math.floor(wy / TILE_SIZE);
+    if (tilePassable(tx, ty)) {
+      return { x: tx * TILE_SIZE + TILE_SIZE / 2, y: ty * TILE_SIZE + TILE_SIZE / 2 };
+    }
+    tries++;
+  }
+  // fallback: any road tile
+  return randomRoadPos();
+}
+
+function randomRoadPosBetween(px, py, minD, maxD) {
+  let pos, tries = 0;
+  do {
+    pos = randomRoadPos();
+    const d = dist(pos.x, pos.y, px, py);
+    if (d >= minD && d <= maxD) return pos;
+    tries++;
+  } while (tries < 300);
+  return randomRoadPosFarFrom(px, py, minD);
+}
+
+function randomSidewalkPos() {
+  let tx, ty, tries = 0;
+  do {
+    tx = Math.floor(Math.random() * CITY_TILES);
+    ty = Math.floor(Math.random() * CITY_TILES);
+    tries++;
+  } while (!isSidewalkTile(tx, ty) && tries < 500);
+  return { x: tx*TILE_SIZE + TILE_SIZE/2, y: ty*TILE_SIZE + TILE_SIZE/2 };
+}
+
+function randomSidewalkPosFarFrom(px, py, minDist) {
+  let pos, tries = 0;
+  do { pos = randomSidewalkPos(); tries++; }
+  while (dist(pos.x, pos.y, px, py) < minDist && tries < 200);
+  return pos;
+}
+
+// ─── Math Helpers ───────────────────────────────────────────────────────────
+function dist(ax, ay, bx, by) {
+  const dx = bx-ax, dy = by-ay;
+  return Math.sqrt(dx*dx + dy*dy);
+}
+function degToRad(d) { return d * Math.PI / 180; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ─── Collision ──────────────────────────────────────────────────────────────
+function isBuildingAt(wx, wy) {
+  const tx = Math.floor(wx / TILE_SIZE), ty = Math.floor(wy / TILE_SIZE);
+  if (tx < 0 || ty < 0 || tx >= CITY_TILES || ty >= CITY_TILES) return true;
+  return map[ty][tx] === TILE.BUILDING;
+}
+function carOverlapsBuilding(cx, cy) {
+  const hw = CAR_W/2, hh = CAR_H/2;
+  return [[cx-hw,cy-hh],[cx+hw,cy-hh],[cx-hw,cy+hh],[cx+hw,cy+hh]]
+    .some(([x,y]) => isBuildingAt(x,y));
+}
+
+// ─── Park Cop Nudge ──────────────────────────────────────────────────────────
+let parkNudgeTimer = 0; // counts down frames; removes temp waypoints at 0
+
+function triggerParkCopNudge() {
+  // Pick the non-CHASE cop closest to the player
+  let bestCop  = null;
+  let bestDist = Infinity;
+  for (const c of cops) {
+    if (c.mode === 'CHASE') continue;
+    const d = dist(c.x, c.y, Player.x, Player.y);
+    if (d < bestDist) { bestDist = d; bestCop = c; }
+  }
+  if (!bestCop) return;
+
+  // Pick a road tile 80-100px from the player in a random direction
+  let nudgePt = null;
+  for (let tries = 0; tries < 200; tries++) {
+    const angle = Math.random() * Math.PI * 2;
+    const r     = 80 + Math.random() * 20; // 80-100px
+    const wx    = Player.x + Math.cos(angle) * r;
+    const wy    = Player.y + Math.sin(angle) * r;
+    const tx    = Math.floor(wx / TILE_SIZE);
+    const ty    = Math.floor(wy / TILE_SIZE);
+    if (tilePassable(tx, ty)) {
+      nudgePt = { x: tx * TILE_SIZE + TILE_SIZE / 2, y: ty * TILE_SIZE + TILE_SIZE / 2, isTemp: true };
+      break;
+    }
+  }
+  if (!nudgePt) return;
+
+  // Insert at the FRONT of patrolPoints
+  bestCop.patrolPoints.unshift(nudgePt);
+  bestCop.patrolIndex      = 0;
+  bestCop.usingTempWaypoint = true;
+  parkNudgeTimer = 360; // 6 seconds
+}
+
+// ─── Cop Export Update ──────────────────────────────────────────────────────
+function updateCopExports() {
+  window.CopModes = cops.map(c => c.mode);
+  window.CopPatrolRoutes = cops.map(c => {
+    const route = c.patrolPoints.slice();
+    if (c.mode === 'SEARCH') {
+      route.unshift({ x: c.lastKnownX, y: c.lastKnownY, isLastKnown: true });
+    }
+    return route;
+  });
+}
+
+// ─── Cop Patrol Generation ───────────────────────────────────────────────────
+function generatePatrolRoute(startX, startY, n) {
+  const route = [];
+  let cx = startX, cy = startY;
+  for (let i = 0; i < n; i++) {
+    const p = randomRoadPosFarFrom(cx, cy, 100);
+    route.push({ x: p.x, y: p.y });
+    cx = p.x; cy = p.y;
+  }
+  return route;
+}
+
+// ─── Cop Spawning ───────────────────────────────────────────────────────────
+function spawnCops(targetCount) {
+  while (cops.length < targetCount) {
+    const pos    = randomRoadPosFarFrom(Player.x, Player.y, COP_SPAWN_DIST);
+    const nPts   = 3 + Math.floor(Math.random() * 3);
+    const patrol = generatePatrolRoute(pos.x, pos.y, nPts);
+    cops.push({
+      x: pos.x, y: pos.y,
+      vx: 0, vy: 0,
+      angle: 0,
+      patrolPoints: patrol,
+      patrolIndex:  0,
+      mode: 'PATROL',
+      // SEARCH state fields
+      lastKnownX: 0,
+      lastKnownY: 0,
+      searchTimer: 0,
+      searchTarget: null,
+      // temp waypoint state
+      usingTempWaypoint: false,
+      // v2: track if this cop already added heat this chase
+      hasAddedHeat: false,
+    });
+  }
+  while (cops.length > targetCount) cops.pop();
+  updateCopExports();
+}
+
+// v2: Heat-based wanted system
+function updateWantedFromHeat() {
+  let lvl = 0;
+  for (let i = 0; i < HEAT_STAR_THRESHOLDS.length; i++) {
+    if (heatPoints >= HEAT_STAR_THRESHOLDS[i]) lvl = i + 1;
+  }
+  if (lvl !== wantedLevel) {
+    wantedLevel = lvl;
+    Audio.setCopSiren(wantedLevel);
+    spawnCops(INITIAL_COP_COUNT + wantedLevel);
+  }
+}
+
+function addHeat(amount) {
+  heatPoints += amount;
+  cleanTimer = 0;
+  lastCleanTime = Date.now();
+  updateWantedFromHeat();
+}
+
+function decayHeat(amount) {
+  heatPoints = Math.max(0, heatPoints - amount);
+  updateWantedFromHeat();
+}
+
+// v2: Calculate speed-based payout
+function calculatePayout(isExposed) {
+  const elapsed = (Date.now() - pickupTime) / 1000;
+  let bonus = 0;
+  if (elapsed < SPEED_BONUS_TARGET) {
+    bonus = Math.min(SPEED_BONUS_MAX, Math.floor(SPEED_BONUS_TARGET - elapsed));
+  } else {
+    bonus = -Math.floor((elapsed - SPEED_BONUS_TARGET) * 0.5);
+  }
+  let total = BASE_EARNINGS + bonus;
+  if (isExposed) total += EXPOSED_PARK_BONUS;
+  total = Math.max(MIN_PAYOUT, total);
+
+  // Build breakdown text
+  let text = 'BASE $' + BASE_EARNINGS;
+  if (bonus > 0) text += ' + SPEED $' + bonus;
+  else if (bonus < 0) text += ' - SLOW $' + Math.abs(bonus);
+  if (isExposed) text += ' + RISK $' + EXPOSED_PARK_BONUS;
+  dropoffBreakdownText = text;
+  dropoffBreakdownTimer = 180; // 3 seconds at 60fps
+
+  return total;
+}
+
+// v2: Find nearest hidden park tile
+function nearestHiddenPark() {
+  let best = null;
+  let bestD = Infinity;
+  for (const hp of hiddenParks) {
+    const d = dist(Player.x, Player.y, hp.wx, hp.wy);
+    if (d < bestD) { bestD = d; best = hp; }
+  }
+  return best;
+}
+
+// ─── Game Init ───────────────────────────────────────────────────────────────
+function initGame() {
+  generateMap();
+
+  const sp   = randomRoadPos();
+  Player.x   = sp.x; Player.y = sp.y;
+  Player.vx  = 0;    Player.vy = 0;
+  Player.angle = 0;  Player.speed = 0;
+
+  clientNameIndex = 0;
+  workers   = [];
+  for (let i = 0; i < 2; i++) {
+    const pos = randomSidewalkPosFarFrom(Player.x, Player.y, 80);
+    pos.clientName = CLIENT_NAMES[clientNameIndex % CLIENT_NAMES.length];
+    clientNameIndex++;
+    workers.push(pos);
+  }
+
+  dropoffPos          = null;
+  earnings            = 0;
+  dropoffs            = 0;
+  _scoreDisplay       = 0;
+  _scoreTarget        = 0;
+  _scoreTween         = 0;
+  _shake              = 0;
+  _particles.length   = 0;
+  wantedLevel         = 0;
+  cops                = [];
+  pulse               = 0;
+  gameState           = STATE.PLAYING; // INTRO → PLAYING is handled separately
+  bustFlash           = 0;
+  gamePhase           = PHASE.FIND_WORKER;
+  workerInCar         = false;
+  isParked            = false;
+  isExposedParked     = false;
+  parkTimerEnd        = 0;
+  parkTimerRemaining  = 0;
+  dropoffEarnings     = 0;
+  nearCopWarningTimer = 0;
+  nearestCopDist      = 999;
+  exposedParkBonusFlash = 0;
+
+  // v2: Reset heat system
+  heatPoints    = 0;
+  cleanTimer    = 0;
+  lastCleanTime = Date.now();
+
+  // v2: Reset speed bonus tracking
+  pickupTime = 0;
+
+  // v2: Reset onboarding (only on very first game)
+  // hasParkedOnce persists across restarts within session — reset here for fresh game
+  hasParkedOnce = false;
+
+  // v2: Reset breakdown display
+  dropoffBreakdownTimer = 0;
+  dropoffBreakdownText  = '';
+
+  window.NearestCopDistance = 999;
+  window.CopModes           = [];
+  parkNudgeTimer            = 0;
+  spawnCops(INITIAL_COP_COUNT);
+  initRain();
+}
+
+function initRain() {
+  rainDrops = [];
+  for (let i = 0; i < RAIN_COUNT; i++) {
+    rainDrops.push({
+      x: Math.random() * CANVAS_W,
+      y: Math.random() * CANVAS_H,
+      len: 6 + Math.random() * 10,
+      speed: RAIN_SPEED + Math.random() * 3,
+      alpha: 0.2 + Math.random() * 0.35,
+    });
+  }
+}
+
+// ─── Update ─────────────────────────────────────────────────────────────────
+function update() {
+  if (gameState === STATE.INTRO) {
+    if (Object.keys(keys).some(k => keys[k])) {
+      gameState = STATE.PLAYING;
+      Audio.init();
+      Audio.startAmbience();
+      audioStarted = true;
+    }
+    return;
+  }
+
+  if (gameState === STATE.BUSTED) {
+    if (bustFlash > 0) bustFlash--;
+    if (Object.keys(keys).some(k => keys[k])) initGame();
+    return;
+  }
+
+  if (!audioStarted && Object.keys(keys).some(k => keys[k])) {
+    Audio.init();
+    Audio.startAmbience();
+    audioStarted = true;
+  }
+
+  pulse += 0.08;
+
+  // v2: Decay dropoff breakdown timer
+  if (dropoffBreakdownTimer > 0) dropoffBreakdownTimer--;
+  if (exposedParkBonusFlash > 0) exposedParkBonusFlash--;
+
+  // ── Steering ──────────────────────────────────────────────────────────────
+  const moving = Math.abs(Player.speed) > 0.1;
+  if (moving && gamePhase !== PHASE.PARKED && gamePhase !== PHASE.EXPOSED_PARK) {
+    if (keys['ArrowLeft']  || keys['a'] || keys['A']) Player.angle -= TURN_RATE * (Player.speed / MAX_SPEED);
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) Player.angle += TURN_RATE * (Player.speed / MAX_SPEED);
+  }
+
+  // ── Throttle ──────────────────────────────────────────────────────────────
+  if (gamePhase !== PHASE.PARKED && gamePhase !== PHASE.EXPOSED_PARK) {
+    const rad  = degToRad(Player.angle);
+    const fwdX = Math.sin(rad), fwdY = -Math.cos(rad);
+    if (keys['ArrowUp']   || keys['w'] || keys['W']) { Player.vx += fwdX * ACCELERATION;       Player.vy += fwdY * ACCELERATION; }
+    if (keys['ArrowDown'] || keys['s'] || keys['S']) { Player.vx -= fwdX * ACCELERATION * 0.6; Player.vy -= fwdY * ACCELERATION * 0.6; }
+  }
+
+  // ── Friction & speed cap ──────────────────────────────────────────────────
+  Player.vx *= FRICTION;
+  Player.vy *= FRICTION;
+  const spd = Math.sqrt(Player.vx*Player.vx + Player.vy*Player.vy);
+  if (spd > MAX_SPEED) { Player.vx = (Player.vx/spd)*MAX_SPEED; Player.vy = (Player.vy/spd)*MAX_SPEED; }
+  Player.speed = spd;
+
+  // ── Move & collide ────────────────────────────────────────────────────────
+  const nx = Player.x + Player.vx, ny = Player.y + Player.vy;
+  if      (!carOverlapsBuilding(nx, ny))       { Player.x = nx; Player.y = ny; }
+  else if (!carOverlapsBuilding(nx, Player.y)) { Player.x = nx; Player.vy = 0; }
+  else if (!carOverlapsBuilding(Player.x, ny)) { Player.y = ny; Player.vx = 0; }
+  else                                          { Player.vx = 0; Player.vy = 0; }
+  Player.x = clamp(Player.x, CAR_W/2, CITY_SIZE - CAR_W/2);
+  Player.y = clamp(Player.y, CAR_H/2, CITY_SIZE - CAR_H/2);
+
+  Audio.setEngineSpeed(Player.speed / MAX_SPEED);
+
+  // ── Phase logic ───────────────────────────────────────────────────────────
+  if (gamePhase === PHASE.FIND_WORKER) {
+    for (let i = workers.length - 1; i >= 0; i--) {
+      if (dist(Player.x, Player.y, workers[i].x, workers[i].y) < WORKER_PICKUP_RADIUS) {
+        workers.splice(i, 1);
+        workerInCar = true;
+        gamePhase   = PHASE.HAS_WORKER;
+        pickupTime  = Date.now();
+        Audio.playPickup();
+        _spawnParticles(Player.x, Player.y, 12, '#00ff88');
+        break;
+      }
+    }
+
+  } else if (gamePhase === PHASE.HAS_WORKER) {
+    const ptx = Math.floor(Player.x / TILE_SIZE);
+    const pty = Math.floor(Player.y / TILE_SIZE);
+    const currentTile = (map[pty] && map[pty][ptx] !== undefined) ? map[pty][ptx] : TILE.BUILDING;
+    const onHiddenPark = currentTile === TILE.HIDDEN_PARK;
+    const onRoad       = currentTile === TILE.ROAD;
+
+    if (onHiddenPark && Player.speed < PARK_SPEED_THRESHOLD) {
+      // Enter hidden park state
+      gamePhase          = PHASE.PARKED;
+      isParked           = true;
+      isExposedParked    = false;
+      parkTimerEnd       = Date.now() + PARK_TIMER_DURATION * 1000;
+      parkTimerRemaining = PARK_TIMER_DURATION;
+      Player.vx = 0; Player.vy = 0;
+      Audio.setParkState(true);
+      hasParkedOnce = true; // v2: onboarding complete
+      // Hidden spot: CHASE cops → SEARCH, PATROL cops stay PATROL
+      for (const c of cops) {
+        if (c.mode === 'CHASE') {
+          c.lastKnownX  = Player.x;
+          c.lastKnownY  = Player.y;
+          c.searchTimer = 720; // 12 * 60 frames
+          c.searchTarget = null;
+          c.mode        = 'SEARCH';
+          c.hasAddedHeat = false;
+        }
+        // PATROL stays PATROL
+      }
+      // Park window cop nudge: pick closest non-CHASE cop and give temp waypoint
+      triggerParkCopNudge();
+
+    } else if (onRoad && Player.speed < PARK_SPEED_THRESHOLD) {
+      // v2: Enter exposed park state
+      gamePhase          = PHASE.EXPOSED_PARK;
+      isParked           = false;
+      isExposedParked    = true;
+      parkTimerEnd       = Date.now() + EXPOSED_PARK_TIMER * 1000;
+      parkTimerRemaining = EXPOSED_PARK_TIMER;
+      exposedParkBonusFlash = 120; // 2 seconds flash for "$+15"
+      Player.vx = 0; Player.vy = 0;
+      Audio.setExposedParkState(true);
+      hasParkedOnce = true; // v2: onboarding complete
+      // Exposed: cops are NOT blinded — no mode changes
+    }
+
+  } else if (gamePhase === PHASE.PARKED) {
+    const now = Date.now();
+    parkTimerRemaining = Math.max(0, (parkTimerEnd - now) / 1000);
+    if (parkTimerRemaining <= 0) {
+      isParked    = false;
+      workerInCar = false;
+      gamePhase   = PHASE.DROPOFF;
+      Audio.setParkState(false);
+      dropoffEarnings = calculatePayout(false);
+      dropoffPos  = randomRoadPosBetween(Player.x, Player.y, DROPOFF_MIN_DIST, DROPOFF_MAX_DIST);
+    }
+
+  } else if (gamePhase === PHASE.EXPOSED_PARK) {
+    // v2: Exposed park — timer runs but cops can still spot & bust
+    const now = Date.now();
+    parkTimerRemaining = Math.max(0, (parkTimerEnd - now) / 1000);
+    if (parkTimerRemaining <= 0) {
+      isExposedParked = false;
+      workerInCar     = false;
+      gamePhase       = PHASE.DROPOFF;
+      Audio.setExposedParkState(false);
+      dropoffEarnings = calculatePayout(true); // exposed bonus included
+      dropoffPos  = randomRoadPosBetween(Player.x, Player.y, DROPOFF_MIN_DIST, DROPOFF_MAX_DIST);
+    }
+
+  } else if (gamePhase === PHASE.DROPOFF) {
+    if (dropoffPos && dist(Player.x, Player.y, dropoffPos.x, dropoffPos.y) < DROP_RADIUS) {
+      earnings  += dropoffEarnings;
+      dropoffs++;
+      _updateScoreTween(earnings);
+      Audio.playDropoff(dropoffEarnings);
+      _spawnParticles(Player.x, Player.y, 18, '#ffee00');
+      dropoffPos = null;
+      gamePhase  = PHASE.FIND_WORKER;
+      const newWorker = randomSidewalkPosFarFrom(Player.x, Player.y, 80);
+      newWorker.clientName = CLIENT_NAMES[clientNameIndex % CLIENT_NAMES.length];
+      clientNameIndex++;
+      workers.push(newWorker);
+      // v2: Heat decays 1 point on successful drop-off
+      decayHeat(1);
+    }
+  }
+
+  // ── Park nudge timer ──────────────────────────────────────────────────────
+  if (parkNudgeTimer > 0) {
+    parkNudgeTimer--;
+    if (parkNudgeTimer === 0) {
+      // Remove temp waypoints from all cops
+      for (const c of cops) {
+        if (c.usingTempWaypoint) {
+          // Remove the first temp waypoint from patrolPoints
+          const idx = c.patrolPoints.findIndex(p => p.isTemp);
+          if (idx !== -1) c.patrolPoints.splice(idx, 1);
+          // Keep patrolIndex in bounds
+          if (c.patrolIndex >= c.patrolPoints.length) c.patrolIndex = 0;
+          c.usingTempWaypoint = false;
+        }
+      }
+    }
+  }
+
+  // ── Rain update ───────────────────────────────────────────────────────────
+  {
+    const rainDx = Math.sin(degToRad(RAIN_ANGLE)) * RAIN_SPEED;
+    const rainDy = Math.cos(degToRad(RAIN_ANGLE)) * RAIN_SPEED;
+    for (const drop of rainDrops) {
+      drop.x += rainDx;
+      drop.y += rainDy;
+      if (drop.y > CANVAS_H + 20) { drop.y = -20; drop.x = Math.random() * CANVAS_W; }
+      if (drop.x > CANVAS_W + 20) { drop.x = -20; }
+    }
+  }
+
+  // ── v2: Heat clean timer — decay heat when no cop is chasing ──────────────
+  let anyCopChasing = false;
+  for (const c of cops) {
+    if (c.mode === 'CHASE') { anyCopChasing = true; break; }
+  }
+  if (!anyCopChasing && heatPoints > 0) {
+    const now = Date.now();
+    const elapsed = (now - lastCleanTime) / 1000;
+    if (elapsed >= HEAT_DECAY_CLEAN_TIME) {
+      decayHeat(1);
+      lastCleanTime = now; // reset for next decay tick
+    }
+  } else if (anyCopChasing) {
+    lastCleanTime = Date.now(); // reset clean streak
+  }
+
+  // ── Cop AI ────────────────────────────────────────────────────────────────
+  nearestCopDist = 999;
+
+  for (const cop of cops) {
+    const pd = dist(cop.x, cop.y, Player.x, Player.y);
+    if (pd < nearestCopDist) nearestCopDist = pd;
+
+    // ── Mode switching ────────────────────────────────────────────────────
+    if (cop.mode === 'CHASE') {
+      if (isParked) {
+        // Player just parked (hidden) — transition to SEARCH
+        cop.lastKnownX  = Player.x;
+        cop.lastKnownY  = Player.y;
+        cop.searchTimer = 720;
+        cop.searchTarget = null;
+        cop.mode        = 'SEARCH';
+        cop.hasAddedHeat = false;
+      } else if (!workerInCar || pd > COP_CHASE_RADIUS * 2) {
+        // Lost sight of player (drove away or dropped worker)
+        cop.lastKnownX  = Player.x;
+        cop.lastKnownY  = Player.y;
+        cop.searchTimer = 720;
+        cop.searchTarget = null;
+        cop.mode        = 'SEARCH';
+        cop.hasAddedHeat = false;
+      }
+      // Note: exposed park does NOT break CHASE — cops can still see player
+    } else if (cop.mode === 'SEARCH') {
+      // Can re-enter CHASE if player is visible (worker in car, not hidden-parked, close)
+      // v2: exposed park does NOT hide from cops
+      if (!isParked && workerInCar && pd < COP_CHASE_RADIUS) {
+        cop.mode = 'CHASE';
+        // v2: Add heat when cop enters CHASE
+        if (!cop.hasAddedHeat) {
+          addHeat(1);
+          cop.hasAddedHeat = true;
+        }
+      }
+    } else {
+      // PATROL: can enter CHASE only if player is visible (not hidden-parked, worker in car)
+      // v2: exposed park does NOT hide from cops — they can chase
+      if (!isParked && workerInCar && pd < COP_CHASE_RADIUS) {
+        cop.mode = 'CHASE';
+        // v2: Add heat when cop enters CHASE
+        if (!cop.hasAddedHeat) {
+          addHeat(1);
+          cop.hasAddedHeat = true;
+        }
+      }
+    }
+
+    // ── Movement by mode ──────────────────────────────────────────────────
+    if (cop.mode === 'PATROL') {
+      cop.hasAddedHeat = false; // reset for next chase
+      if (cop.patrolPoints.length === 0) { cop.vx = 0; cop.vy = 0; }
+      else {
+        const tgt = cop.patrolPoints[cop.patrolIndex];
+        const dx  = tgt.x - cop.x, dy = tgt.y - cop.y;
+        const d   = Math.sqrt(dx*dx + dy*dy);
+        if (d < PATROL_REACH) {
+          // Advance; if we reached a temp waypoint, clear it
+          if (tgt.isTemp && cop.usingTempWaypoint) {
+            cop.patrolPoints.splice(cop.patrolIndex, 1);
+            cop.usingTempWaypoint = false;
+            if (cop.patrolPoints.length === 0) { cop.vx = 0; cop.vy = 0; }
+            else cop.patrolIndex = cop.patrolIndex % cop.patrolPoints.length;
+          } else {
+            cop.patrolIndex = (cop.patrolIndex + 1) % cop.patrolPoints.length;
+          }
+        } else {
+          cop.vx    = (dx/d) * COP_PATROL_SPEED;
+          cop.vy    = (dy/d) * COP_PATROL_SPEED;
+          cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+        }
+      }
+
+    } else if (cop.mode === 'SEARCH') {
+      cop.searchTimer--;
+
+      if (cop.searchTimer <= 0) {
+        cop.mode = 'PATROL';
+        cop.searchTarget = null;
+        cop.hasAddedHeat = false;
+      } else {
+        const isNearHiddenPark = isParked && dist(cop.x, cop.y, Player.x, Player.y) < 40;
+
+        // Pick a target: either lastKnown or a sweep tile
+        if (!cop.searchTarget) {
+          const dToLK = dist(cop.x, cop.y, cop.lastKnownX, cop.lastKnownY);
+          if (dToLK > 32) {
+            cop.searchTarget = { x: cop.lastKnownX, y: cop.lastKnownY };
+          } else {
+            // Arrived at lastKnown — sweep nearby road tiles
+            cop.searchTarget = randomRoadPosNear(cop.lastKnownX, cop.lastKnownY, 80);
+          }
+        }
+
+        // If near hidden park, just mill around — don't bust
+        if (isNearHiddenPark) {
+          cop.searchTarget = randomRoadPosNear(cop.x, cop.y, 60);
+        }
+
+        const dx = cop.searchTarget.x - cop.x;
+        const dy = cop.searchTarget.y - cop.y;
+        const d  = Math.sqrt(dx*dx + dy*dy);
+        if (d < PATROL_REACH) {
+          cop.searchTarget = null; // pick a new one next frame
+        } else {
+          cop.vx    = (dx/d) * COP_SEARCH_SPEED;
+          cop.vy    = (dy/d) * COP_SEARCH_SPEED;
+          cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+        }
+      }
+
+    } else {
+      // CHASE
+      const dx = Player.x - cop.x, dy = Player.y - cop.y;
+      const d  = Math.sqrt(dx*dx + dy*dy);
+      if (d > 0) {
+        cop.vx    = (dx/d) * COP_CHASE_SPEED;
+        cop.vy    = (dy/d) * COP_CHASE_SPEED;
+        cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+      }
+    }
+
+    cop.x += cop.vx;
+    cop.y += cop.vy;
+
+    // BUST: cop reaches player while worker is in car AND not in hidden park
+    // v2: exposed park is NOT safe — cops can bust during exposed park
+    if (workerInCar && !isParked && pd < COP_BUST_RADIUS) {
+      gameState = STATE.BUSTED;
+      bustFlash = 30;
+      _shake = 14;
+      _spawnParticles(Player.x, Player.y, 20, '#ff2200');
+      Audio.setCopSiren(0);
+      Audio.setParkState(false);
+      Audio.playBust();
+      if (isExposedParked) {
+        isExposedParked = false;
+        Audio.setExposedParkState(false);
+      }
+      return;
+    }
+  }
+
+  window.NearestCopDistance = nearestCopDist;
+  Audio.setCopProximity(nearestCopDist);
+  updateCopExports();
+
+  // Near-cop warning while parked (visual stress, no bust) — both hidden and exposed
+  if ((isParked || isExposedParked) && nearestCopDist < COP_NEAR_PARK_RADIUS) nearCopWarningTimer = 30;
+  if (nearCopWarningTimer > 0) nearCopWarningTimer--;
+}
+
+// ─── Rendering ──────────────────────────────────────────────────────────────
+function getCameraOffset() {
+  return {
+    ox: Math.round(Player.x - CANVAS_W / 2),
+    oy: Math.round(Player.y - CANVAS_H / 2),
+  };
+}
+
+function drawMap(ox, oy) {
+  const startTX = Math.max(0, Math.floor(ox / TILE_SIZE));
+  const startTY = Math.max(0, Math.floor(oy / TILE_SIZE));
+  const endTX   = Math.min(CITY_TILES-1, Math.ceil((ox+CANVAS_W) / TILE_SIZE));
+  const endTY   = Math.min(CITY_TILES-1, Math.ceil((oy+CANVAS_H) / TILE_SIZE));
+
+  for (let ty = startTY; ty <= endTY; ty++) {
+    for (let tx = startTX; tx <= endTX; tx++) {
+      const sx = tx*TILE_SIZE - ox, sy = ty*TILE_SIZE - oy;
+      const t  = map[ty][tx];
+
+      if (t === TILE.HIDDEN_PARK) {
+        ctx.fillStyle = COLOR.HIDDEN_PARK;
+        ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
+        // Faint purple glow border
+        ctx.save();
+        ctx.shadowColor = '#4400aa';
+        ctx.shadowBlur  = 8;
+        ctx.strokeStyle = 'rgba(80,0,180,0.25)';
+        ctx.lineWidth   = 1;
+        ctx.strokeRect(sx+0.5, sy+0.5, TILE_SIZE-1, TILE_SIZE-1);
+        ctx.restore();
+        // Subtle discovery marker
+        ctx.save();
+        ctx.globalAlpha  = 0.2;
+        ctx.fillStyle    = '#8844cc';
+        ctx.font         = '8px monospace';
+        ctx.textAlign    = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('▮', sx + TILE_SIZE/2, sy + TILE_SIZE/2);
+        ctx.textBaseline = 'alphabetic';
+        ctx.globalAlpha  = 1;
+        ctx.restore();
+      } else if (t === TILE.ROAD) {
+        ctx.fillStyle = COLOR.ROAD;
+        ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
+      } else if (t === TILE.SIDEWALK) {
+        ctx.fillStyle = COLOR.SIDEWALK;
+        ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
+      } else {
+        ctx.fillStyle = blockColors[ty][tx];
+        ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
+      }
+    }
+  }
+
+  // Streetlight pools at intersections
+  for (let ty = startTY; ty <= endTY; ty++) {
+    for (let tx = startTX; tx <= endTX; tx++) {
+      if (!isRoadCol(tx) || !isRoadRow(ty)) continue;
+      const sx = tx * TILE_SIZE + TILE_SIZE / 2 - ox;
+      const sy = ty * TILE_SIZE + TILE_SIZE / 2 - oy;
+      const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, 40);
+      grad.addColorStop(0,   'rgba(255,240,180,0.06)');
+      grad.addColorStop(1,   'rgba(255,240,180,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(sx - 40, sy - 40, 80, 80);
+    }
+  }
+
+  // Road dashes (also on HIDDEN_PARK for visual continuity)
+  ctx.strokeStyle = COLOR.ROAD_MARK;
+  ctx.lineWidth   = 1;
+  ctx.setLineDash([6, 10]);
+
+  const roadLike = (r, c) =>
+    r >= 0 && r < CITY_TILES && c >= 0 && c < CITY_TILES &&
+    (map[r][c] === TILE.ROAD || map[r][c] === TILE.HIDDEN_PARK);
+
+  for (let ty = startTY; ty <= endTY; ty++) {
+    for (let tx = startTX; tx <= endTX; tx++) {
+      const t = map[ty][tx];
+      if (t !== TILE.ROAD && t !== TILE.HIDDEN_PARK) continue;
+      const sx = tx*TILE_SIZE - ox, sy = ty*TILE_SIZE - oy;
+      const h  = roadLike(ty-1, tx) && roadLike(ty+1, tx);
+      const v  = roadLike(ty, tx-1) && roadLike(ty, tx+1);
+      if (h && !v) {
+        ctx.beginPath(); ctx.moveTo(sx+TILE_SIZE/2, sy); ctx.lineTo(sx+TILE_SIZE/2, sy+TILE_SIZE); ctx.stroke();
+      } else if (v && !h) {
+        ctx.beginPath(); ctx.moveTo(sx, sy+TILE_SIZE/2); ctx.lineTo(sx+TILE_SIZE, sy+TILE_SIZE/2); ctx.stroke();
+      }
+    }
+  }
+  ctx.setLineDash([]);
+}
+
+function drawWindows(ox, oy) {
+  for (const w of windows) {
+    if (w.px < ox || w.px > ox+CANVAS_W || w.py < oy || w.py > oy+CANVAS_H) continue;
+    let alpha = 1;
+    if (w.flicker) {
+      alpha = 0.6 + 0.4 * Math.sin(pulse * 2.3 + w.phase);
+    }
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = w.bright ? '#ffffcc' : '#ffee88';
+    ctx.fillRect(w.px-ox, w.py-oy, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawNeonSigns(ox, oy) {
+  for (const n of neonSigns) {
+    const sx = n.px - ox, sy = n.py - oy;
+    if (sx + n.w < 0 || sx > CANVAS_W || sy + n.h < 0 || sy > CANVAS_H) continue;
+
+    ctx.save();
+
+    // Chromatic aberration: red glow shifted +1px right, blue glow -1px left
+    ctx.globalAlpha = 0.3;
+    ctx.shadowBlur  = 10;
+    ctx.shadowColor = '#ff0000';
+    ctx.strokeStyle = '#ff0000';
+    ctx.lineWidth   = 1.5;
+    ctx.strokeRect(sx + 1, sy, n.w, n.h);
+    ctx.shadowColor = '#0000ff';
+    ctx.strokeStyle = '#0000ff';
+    ctx.strokeRect(sx - 1, sy, n.w, n.h);
+    ctx.globalAlpha = 1;
+
+    // Main glow and fill
+    ctx.shadowColor = n.color;
+    ctx.shadowBlur  = 14;
+    ctx.fillStyle   = n.color + '44';
+    ctx.fillRect(sx, sy, n.w, n.h);
+    ctx.strokeStyle = n.color;
+    ctx.lineWidth   = 1.5;
+    ctx.strokeRect(sx, sy, n.w, n.h);
+
+    // Label text
+    if (n.label) {
+      ctx.shadowBlur   = 6;
+      ctx.shadowColor  = n.color;
+      ctx.fillStyle    = n.color;
+      ctx.font         = '8px monospace';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(n.label, sx + n.w / 2, sy + n.h / 2);
+      ctx.textBaseline = 'alphabetic';
+    }
+
+    ctx.restore();
+  }
+}
+
+function drawRain() {
+  const rainDx = Math.sin(degToRad(RAIN_ANGLE));
+  const rainDy = Math.cos(degToRad(RAIN_ANGLE));
+  ctx.save();
+  ctx.strokeStyle = 'rgba(160,200,255,1)';
+  ctx.lineWidth   = 1;
+  for (const drop of rainDrops) {
+    ctx.globalAlpha = drop.alpha;
+    ctx.beginPath();
+    ctx.moveTo(drop.x, drop.y);
+    ctx.lineTo(drop.x - rainDx * drop.len, drop.y - rainDy * drop.len);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawPuddles(ox, oy) {
+  // Draw shimmer on road tiles within view — reflect neon colors
+  const t = Date.now() * 0.001;
+  const viewTX = Math.floor((Player.x - CANVAS_W/2) / TILE_SIZE);
+  const viewTY = Math.floor((Player.y - CANVAS_H/2) / TILE_SIZE);
+  const rangeX = Math.ceil(CANVAS_W / TILE_SIZE) + 2;
+  const rangeY = Math.ceil(CANVAS_H / TILE_SIZE) + 2;
+
+  ctx.save();
+  for (let ty = viewTY; ty < viewTY + rangeY; ty++) {
+    for (let tx = viewTX; tx < viewTX + rangeX; tx++) {
+      if (ty < 0 || tx < 0 || ty >= CITY_TILES || tx >= CITY_TILES) continue;
+      if (map[ty][tx] !== TILE.ROAD && map[ty][tx] !== TILE.HIDDEN_PARK) continue;
+      const sx = tx * TILE_SIZE - ox;
+      const sy = ty * TILE_SIZE - oy;
+
+      // Find nearest neon to this tile for puddle color
+      let nearestNeon = null, nearestDist = 999999;
+      for (const n of neonSigns) {
+        const nx = n.px + n.w/2, ny = n.py + n.h/2;
+        const wx = tx * TILE_SIZE + TILE_SIZE/2, wy = ty * TILE_SIZE + TILE_SIZE/2;
+        const d = Math.hypot(nx - wx, ny - wy);
+        if (d < nearestDist && d < 120) { nearestDist = d; nearestNeon = n; }
+      }
+
+      if (!nearestNeon) continue;
+
+      // Shimmer alpha: distance falloff + time wobble
+      const alpha = (1 - nearestDist / 120) * 0.12 * (0.7 + 0.3 * Math.sin(t * 2 + tx + ty));
+      if (alpha < 0.01) continue;
+
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle   = nearestNeon.color;
+      // Puddle is bottom half of road tile (reflection sits low)
+      ctx.fillRect(sx + 2, sy + TILE_SIZE * 0.55, TILE_SIZE - 4, TILE_SIZE * 0.35);
+    }
+  }
+  ctx.restore();
+}
+
+function drawWaypoints(ox, oy) {
+  const p = 0.6 + 0.4 * Math.sin(pulse);
+  const r = 10  + 4   * Math.sin(pulse);
+
+  // Worker waypoints (sidewalk curb)
+  for (const w of workers) {
+    const sx = w.x - ox, sy = w.y - oy;
+    if (sx < -60 || sx > CANVAS_W+60 || sy < -60 || sy > CANVAS_H+60) continue;
+    ctx.save();
+    ctx.globalAlpha = p;
+    ctx.shadowColor = '#00ff55'; ctx.shadowBlur = 20;
+    ctx.strokeStyle = '#00ff55'; ctx.lineWidth  = 2;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    // Person icon
+    ctx.save();
+    ctx.fillStyle = '#00ff88';
+    ctx.font      = '14px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('◉', sx, sy);
+    ctx.textBaseline = 'alphabetic';
+    ctx.font    = '8px monospace';
+    ctx.fillStyle = '#00ff55';
+    ctx.fillText(w.clientName || 'CLIENT', sx, sy - r - 4);
+    ctx.restore();
+  }
+
+  // Drop-off waypoint (after parking transaction)
+  if (gamePhase === PHASE.DROPOFF && dropoffPos) {
+    const sx = dropoffPos.x - ox, sy = dropoffPos.y - oy;
+    if (sx >= -60 && sx <= CANVAS_W+60 && sy >= -60 && sy <= CANVAS_H+60) {
+      ctx.save();
+      ctx.globalAlpha = p;
+      ctx.shadowColor = '#ffee00'; ctx.shadowBlur = 20;
+      ctx.strokeStyle = '#ffee00'; ctx.lineWidth  = 2;
+      ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+      ctx.fillStyle = '#ffee55';
+      ctx.font      = '9px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('DROP-OFF', sx, sy - r - 4);
+    }
+  }
+}
+
+function drawCar(cx, cy, angle, isPlayer) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(degToRad(angle));
+
+  if (isPlayer) {
+    ctx.fillStyle = '#dddddd';
+    ctx.fillRect(-CAR_W/2, -CAR_H/2, CAR_W, CAR_H);
+    // Front headlights with glow
+    ctx.save();
+    ctx.shadowColor = '#ffee55';
+    ctx.shadowBlur  = 8;
+    ctx.fillStyle   = '#ffee99';
+    ctx.fillRect(-CAR_W/2+2, -CAR_H/2, 4, 3);
+    ctx.fillRect(CAR_W/2-6,  -CAR_H/2, 4, 3);
+    ctx.restore();
+    ctx.fillStyle = '#ff2200';
+    ctx.fillRect(-CAR_W/2+2, CAR_H/2-3, 4, 3);
+    ctx.fillRect(CAR_W/2-6,  CAR_H/2-3, 4, 3);
+    ctx.fillStyle = '#334455';
+    ctx.fillRect(-CAR_W/2+3, -CAR_H/2+4, CAR_W-6, 6);
+  } else {
+    ctx.save();
+    ctx.shadowColor = '#0088ff'; ctx.shadowBlur = 12;
+    ctx.fillStyle   = '#aaccff';
+    ctx.fillRect(-CAR_W/2, -CAR_H/2, CAR_W, CAR_H);
+    ctx.restore();
+    ctx.fillStyle = '#0044cc';
+    ctx.fillRect(-CAR_W/2+3, -CAR_H/2+4, CAR_W-6, 5);
+    ctx.fillRect(-CAR_W/2+3, CAR_H/2-9,  CAR_W-6, 5);
+    // Siren flash — alternates only in CHASE mode
+    ctx.fillStyle = Math.sin(pulse*3) > 0 ? '#ff0000' : '#0000ff';
+    ctx.fillRect(-4, -CAR_H/2-3, 8, 3);
+  }
+  ctx.restore();
+}
+
+function drawCops(ox, oy) {
+  for (const cop of cops) {
+    const sx = cop.x - ox, sy = cop.y - oy;
+    if (sx < -60 || sx > CANVAS_W+60 || sy < -60 || sy > CANVAS_H+60) continue;
+    drawCar(sx, sy, cop.angle, false);
+  }
+}
+
+// Draw circular park countdown at car screen position
+function drawParkCountdown(screenX, screenY, duration) {
+  const elapsed  = duration - parkTimerRemaining;
+  const progress = elapsed / duration; // 0→1 as timer runs down
+  const radius   = 22;
+  const start    = -Math.PI / 2;
+  const end      = start + (1 - progress) * Math.PI * 2;
+
+  ctx.save();
+  // Outer ring background
+  ctx.beginPath();
+  ctx.arc(screenX, screenY, radius, 0, Math.PI*2);
+  ctx.strokeStyle = isExposedParked ? 'rgba(180,150,0,0.4)' : 'rgba(80,0,180,0.4)';
+  ctx.lineWidth   = 5;
+  ctx.stroke();
+
+  // Remaining arc (depleting)
+  if (parkTimerRemaining > 0) {
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, radius, start, end, false);
+    const frac = parkTimerRemaining / duration;
+    if (isExposedParked) {
+      ctx.strokeStyle = frac > 0.5 ? '#ffcc00' : frac > 0.25 ? '#ff8800' : '#ff2200';
+    } else {
+      ctx.strokeStyle = frac > 0.5 ? '#cc44ff' : frac > 0.25 ? '#ff8800' : '#ff2200';
+    }
+    ctx.lineWidth   = 4;
+    ctx.shadowColor = ctx.strokeStyle;
+    ctx.shadowBlur  = 10;
+    ctx.stroke();
+  }
+
+  // Tick text inside
+  ctx.fillStyle    = isExposedParked ? '#ffcc88' : '#cc88ff';
+  ctx.font         = 'bold 11px monospace';
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(Math.ceil(parkTimerRemaining) + 's', screenX, screenY);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+// v2: Draw exposed park hint ring (pulsing yellow) around car
+function drawExposedParkHint(screenX, screenY) {
+  const ptx = Math.floor(Player.x / TILE_SIZE);
+  const pty = Math.floor(Player.y / TILE_SIZE);
+  const currentTile = (map[pty] && map[pty][ptx] !== undefined) ? map[pty][ptx] : TILE.BUILDING;
+
+  // Show hint: on ROAD, speed < 0.5, worker in car, not already parked
+  if (currentTile === TILE.ROAD && workerInCar && Player.speed < 0.5 &&
+      gamePhase === PHASE.HAS_WORKER) {
+    const hintAlpha = 0.15 + 0.1 * Math.sin(pulse * 2);
+    const hintRadius = 24 + 3 * Math.sin(pulse * 1.5);
+    ctx.save();
+    ctx.globalAlpha = hintAlpha;
+    ctx.strokeStyle = '#ffcc00';
+    ctx.lineWidth   = 2;
+    ctx.shadowColor = '#ffcc00';
+    ctx.shadowBlur  = 8;
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, hintRadius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// v2: Draw first-run onboarding arrow to nearest HIDDEN_PARK
+function drawOnboardingArrow(ox, oy) {
+  if (hasParkedOnce || dropoffs > 0 || workerInCar) return;
+  // Only show when in FIND_WORKER phase on first run
+  if (gamePhase !== PHASE.FIND_WORKER) return;
+
+  const hp = nearestHiddenPark();
+  if (!hp) return;
+
+  const screenX = CANVAS_W / 2;
+  const screenY = CANVAS_H / 2;
+  const dx = hp.wx - Player.x;
+  const dy = hp.wy - Player.y;
+  const d  = Math.sqrt(dx * dx + dy * dy);
+  if (d < 10) return;
+
+  const angle = Math.atan2(dy, dx);
+  const arrowDist = 50; // distance from car center
+  const ax = screenX + Math.cos(angle) * arrowDist;
+  const ay = screenY + Math.sin(angle) * arrowDist;
+
+  ctx.save();
+  ctx.globalAlpha = 0.5 + 0.2 * Math.sin(pulse * 1.5);
+
+  // Arrow head
+  ctx.translate(ax, ay);
+  ctx.rotate(angle);
+  ctx.fillStyle = '#8844cc';
+  ctx.beginPath();
+  ctx.moveTo(12, 0);
+  ctx.lineTo(-6, -7);
+  ctx.lineTo(-6, 7);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  // Label
+  ctx.save();
+  ctx.globalAlpha = 0.5 + 0.2 * Math.sin(pulse * 1.5);
+  ctx.fillStyle    = '#8844cc';
+  ctx.font         = '9px monospace';
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  const labelX = screenX + Math.cos(angle) * (arrowDist + 22);
+  const labelY = screenY + Math.sin(angle) * (arrowDist + 22);
+  ctx.fillText('FIND A SPOT', labelX, labelY);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
+}
+
+function drawHUD() {
+  // ── Top left: earnings ───────────────────────────────────────────────────
+  ctx.fillStyle = '#00ff55';
+  ctx.font      = 'bold 20px monospace';
+  ctx.textAlign = 'left';
+  // Score tween: flash white briefly on earn
+  if (_scoreTween > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${_scoreTween * 0.7})`;
+    ctx.fillRect(8, 8, 90, 26);
+  }
+  ctx.fillStyle = '#00ff55';
+  ctx.fillText('$' + Math.round(_scoreDisplay), 14, 28);
+
+  // ── Passenger status ─────────────────────────────────────────────────────
+  if (workerInCar || isParked || isExposedParked) {
+    ctx.save();
+    ctx.fillStyle  = '#ff9944';
+    ctx.font       = 'bold 12px monospace';
+    ctx.textAlign  = 'left';
+    ctx.shadowColor = '#ff6600';
+    ctx.shadowBlur  = 8;
+    ctx.fillText('CLIENT: ABOARD', 14, 46);
+    ctx.restore();
+  } else if (gamePhase === PHASE.FIND_WORKER && workers.length > 0) {
+    // Hint arrow toward nearest worker
+    const w   = workers[0];
+    const dx  = w.x - Player.x, dy = w.y - Player.y;
+    const a   = Math.atan2(dx, -dy);
+    ctx.fillStyle = '#00ff88';
+    ctx.font      = '11px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('CLIENT AVAILABLE ' + angleToArrow(a), 14, 46);
+  }
+
+  // ── Top right: wanted stars (v2: heat-based) ─────────────────────────────
+  ctx.font      = '22px monospace';
+  ctx.textAlign = 'right';
+  for (let i = 0; i < MAX_STARS; i++) {
+    ctx.fillStyle = i < wantedLevel ? '#ffee00' : '#333333';
+    ctx.fillText(i < wantedLevel ? '★' : '☆', CANVAS_W - 14 - (MAX_STARS-1-i)*26, 28);
+  }
+
+  // v2: Heat points indicator (small text under stars)
+  if (heatPoints > 0) {
+    ctx.fillStyle = '#ff6644';
+    ctx.font      = '9px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText('HEAT: ' + heatPoints, CANVAS_W - 14, 44);
+  }
+
+  // ── Bottom left: title ───────────────────────────────────────────────────
+  ctx.fillStyle = '#666666';
+  ctx.font      = '11px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('NOCTURNAL TRANSIT LLC', 14, CANVAS_H - 14);
+
+  // ── Bottom center: park timer HUD OR speed bar ───────────────────────────
+  const BAR_W = 120, BAR_H = 8;
+  const bx    = (CANVAS_W - BAR_W) / 2;
+  const by    = CANVAS_H - 22;
+
+  if (isParked) {
+    // Show park countdown bar in HUD (hidden park)
+    const frac = parkTimerRemaining / PARK_TIMER_DURATION;
+    ctx.fillStyle = '#111122';
+    ctx.fillRect(bx, by, BAR_W, BAR_H);
+    const barCol = frac > 0.5 ? '#cc44ff' : frac > 0.25 ? '#ff8800' : '#ff2200';
+    ctx.fillStyle = barCol;
+    ctx.fillRect(bx, by, BAR_W * frac, BAR_H);
+    ctx.strokeStyle = '#552288';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(bx, by, BAR_W, BAR_H);
+    ctx.fillStyle   = '#aa66cc';
+    ctx.font        = '10px monospace';
+    ctx.textAlign   = 'center';
+    const flavorIdx = Math.min(5, Math.ceil(parkTimerRemaining));
+    ctx.fillText(PARK_FLAVOR[flavorIdx], CANVAS_W/2, CANVAS_H - 10);
+
+  } else if (isExposedParked) {
+    // v2: Exposed park HUD
+    const frac = parkTimerRemaining / EXPOSED_PARK_TIMER;
+    ctx.fillStyle = '#111122';
+    ctx.fillRect(bx, by, BAR_W, BAR_H);
+    const barCol = frac > 0.5 ? '#ffcc00' : frac > 0.25 ? '#ff8800' : '#ff2200';
+    ctx.fillStyle = barCol;
+    ctx.fillRect(bx, by, BAR_W * frac, BAR_H);
+    ctx.strokeStyle = '#665500';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(bx, by, BAR_W, BAR_H);
+    // "EXPOSED — Xs"
+    ctx.fillStyle   = '#ffcc44';
+    ctx.font        = 'bold 11px monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillText('EXPOSED — ' + Math.ceil(parkTimerRemaining) + 's', CANVAS_W/2, CANVAS_H - 10);
+    // Flash "$+15" bonus when entering exposed park
+    if (exposedParkBonusFlash > 0) {
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, exposedParkBonusFlash / 60);
+      ctx.fillStyle   = '#00ff88';
+      ctx.font        = 'bold 14px monospace';
+      ctx.textAlign   = 'center';
+      ctx.fillText('$+' + EXPOSED_PARK_BONUS, CANVAS_W/2, CANVAS_H - 36);
+      ctx.restore();
+    }
+
+  } else {
+    // Normal speed bar
+    const sr   = Player.speed / MAX_SPEED;
+    const sCol = sr > 0.8 ? '#ff4400' : sr > 0.5 ? '#ffaa00' : '#00ff88';
+    ctx.fillStyle = '#222233';
+    ctx.fillRect(bx, by, BAR_W, BAR_H);
+    ctx.fillStyle = sCol;
+    ctx.fillRect(bx, by, BAR_W * sr, BAR_H);
+    ctx.strokeStyle = '#444455';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(bx, by, BAR_W, BAR_H);
+    ctx.fillStyle   = '#555566';
+    ctx.font        = '10px monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillText('SPD', CANVAS_W/2, CANVAS_H - 10);
+  }
+
+  // v2: Dropoff breakdown display (shows for a few seconds after drop-off)
+  if (dropoffBreakdownTimer > 0 && dropoffBreakdownText) {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, dropoffBreakdownTimer / 60);
+    ctx.fillStyle   = '#00ff88';
+    ctx.font        = 'bold 12px monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillText(dropoffBreakdownText, CANVAS_W / 2, CANVAS_H / 2 + 60);
+    ctx.restore();
+  }
+}
+
+function angleToArrow(rad) {
+  const deg    = ((rad * 180 / Math.PI) + 360) % 360;
+  const arrows = ['↑','↗','→','↘','↓','↙','←','↖'];
+  return arrows[Math.round(deg / 45) % 8];
+}
+
+function drawIntroScreen() {
+  // Dark background
+  ctx.fillStyle = '#0a0a12';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  // Scanlines on menu
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  for (let y = 0; y < CANVAS_H; y += 2) ctx.fillRect(0, y, CANVAS_W, 1);
+  ctx.restore();
+
+  // Pulsing neon title
+  const t = Date.now() * 0.001;
+  const flicker = 0.85 + 0.15 * Math.sin(t * 7.3);
+
+  ctx.save();
+  ctx.textAlign   = 'center';
+  ctx.shadowBlur  = 32 * flicker;
+  ctx.shadowColor = '#ff00aa';
+  ctx.fillStyle   = `rgba(255,0,170,${flicker})`;
+  ctx.font        = 'bold 64px monospace';
+  ctx.fillText('NIGHT SHIFT', CANVAS_W / 2, 160);
+  ctx.restore();
+
+  ctx.save();
+  ctx.textAlign   = 'center';
+  ctx.fillStyle   = '#556688';
+  ctx.font        = '13px monospace';
+  ctx.fillText('NOCTURNAL TRANSIT LLC  ·  PREMIUM AFTER-DARK LOGISTICS', CANVAS_W / 2, 192);
+  ctx.restore();
+
+  // Controls
+  const controls = [
+    ['↑  /  W',       'Accelerate'],
+    ['↓  /  S',       'Brake / Reverse'],
+    ['←  →  /  A D', 'Steer'],
+    ['Slow on road',  'Hidden park (safe, 5s)'],
+    ['Slow on street','Exposed park (+$15, 3s, risky)'],
+    ['Avoid cops',    'Bust = game over'],
+  ];
+
+  ctx.save();
+  ctx.textAlign = 'left';
+  const colX = CANVAS_W / 2 - 190;
+  let y = 260;
+  ctx.fillStyle = '#445566';
+  ctx.font      = '11px monospace';
+  ctx.fillText('CONTROLS', colX, y); y += 22;
+  for (const [key, action] of controls) {
+    ctx.fillStyle = '#aabbcc';
+    ctx.font      = 'bold 12px monospace';
+    ctx.fillText(key, colX, y);
+    ctx.fillStyle = '#667788';
+    ctx.font      = '12px monospace';
+    ctx.fillText(action, colX + 190, y);
+    y += 22;
+  }
+  ctx.restore();
+
+  // Press to start
+  const blink = Math.sin(t * 2.5) > 0;
+  if (blink) {
+    ctx.save();
+    ctx.textAlign  = 'center';
+    ctx.fillStyle  = '#aaffee';
+    ctx.font       = '14px monospace';
+    ctx.shadowColor = '#aaffee';
+    ctx.shadowBlur  = 10;
+    ctx.fillText('[ PRESS ANY KEY OR CLICK TO START ]', CANVAS_W / 2, CANVAS_H - 60);
+    ctx.restore();
+  }
+
+  // Bottom tag
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#223344';
+  ctx.font      = '10px monospace';
+  ctx.fillText('a d-g-k production', CANVAS_W / 2, CANVAS_H - 30);
+  ctx.restore();
+}
+
+function drawBustedScreen() {
+  if (bustFlash > 0) {
+    ctx.fillStyle = `rgba(255,0,0,${bustFlash/30*0.7})`;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    return;
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  ctx.textAlign = 'center';
+
+  // Title
+  ctx.fillStyle = '#ffffff';
+  ctx.font      = 'bold 52px monospace';
+  ctx.fillText('SERVICE TERMINATED', CANVAS_W/2, CANVAS_H/2 - 80);
+
+  // Red rule
+  ctx.fillStyle = '#ff2200';
+  ctx.fillRect(CANVAS_W/2 - 180, CANVAS_H/2 - 58, 360, 3);
+
+  // Subtitle
+  ctx.fillStyle = '#ff4422';
+  ctx.font      = 'bold 16px monospace';
+  ctx.fillText('REGULATORY INTERVENTION', CANVAS_W/2, CANVAS_H/2 - 38);
+
+  // Body text
+  ctx.fillStyle = '#cccccc';
+  ctx.font      = '13px monospace';
+  ctx.fillText('Officer Schmidt has some questions.', CANVAS_W/2, CANVAS_H/2 - 8);
+  ctx.fillText('You explain that you operate a premium nocturnal transportation service.', CANVAS_W/2, CANVAS_H/2 + 12);
+  ctx.fillText('Officer Schmidt does not find this compelling.', CANVAS_W/2, CANVAS_H/2 + 32);
+
+  // Earnings
+  ctx.fillStyle = '#00ff55';
+  ctx.font      = 'bold 20px monospace';
+  ctx.fillText('TOTAL REVENUE: $' + earnings, CANVAS_W/2, CANVAS_H/2 + 62);
+
+  // Blink restart + lawyer gag
+  const blink = Math.floor(Date.now()/500) % 2 === 0;
+  ctx.fillStyle = blink ? '#ffffff' : '#888888';
+  ctx.font      = '15px monospace';
+  ctx.fillText('PRESS SPACE TO RESUME OPERATIONS', CANVAS_W/2, CANVAS_H/2 + 94);
+  ctx.fillStyle = blink ? '#aaaaaa' : '#555555';
+  ctx.font      = '13px monospace';
+  ctx.fillText('[ CALL A LAWYER ]', CANVAS_W/2, CANVAS_H/2 + 116);
+}
+
+// ─── Main Loop ──────────────────────────────────────────────────────────────
+function render() {
+  if (gameState === STATE.INTRO) {
+    ctx.fillStyle = COLOR.BG;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    drawIntroScreen();
+    return;
+  }
+
+  const { ox, oy } = getCameraOffset();
+
+  ctx.fillStyle = COLOR.BG;
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  drawMap(ox, oy);
+  drawPuddles(ox, oy);
+  drawWindows(ox, oy);
+  drawNeonSigns(ox, oy);
+  drawWaypoints(ox, oy);
+  drawCops(ox, oy);
+
+  // Player car
+  drawCar(CANVAS_W/2, CANVAS_H/2, Player.angle, true);
+
+  // v2: Exposed park hint ring (yellow pulse when slow on road with worker)
+  drawExposedParkHint(CANVAS_W/2, CANVAS_H/2);
+
+  // Park countdown ring (drawn at car center on screen)
+  if (isParked) {
+    drawParkCountdown(CANVAS_W/2, CANVAS_H/2 - CAR_H - 14, PARK_TIMER_DURATION);
+  } else if (isExposedParked) {
+    drawParkCountdown(CANVAS_W/2, CANVAS_H/2 - CAR_H - 14, EXPOSED_PARK_TIMER);
+  }
+
+  // v2: First-run onboarding arrow
+  drawOnboardingArrow(ox, oy);
+
+  // Near-cop warning flash at screen edge (parked state — visual stress)
+  if (nearCopWarningTimer > 0) {
+    const alpha = (nearCopWarningTimer / 30) * 0.55;
+    ctx.save();
+    ctx.strokeStyle = `rgba(255,0,0,${alpha})`;
+    ctx.lineWidth   = 16;
+    ctx.strokeRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.restore();
+  }
+
+  // ── CRT Scanlines ─────────────────────────────────────────────────────────
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  for (let y = 0; y < CANVAS_H; y += 2) {
+    ctx.fillRect(0, y, CANVAS_W, 1);
+  }
+  ctx.restore();
+
+  // ── Vignette ──────────────────────────────────────────────────────────────
+  {
+    const cx = CANVAS_W / 2, cy = CANVAS_H / 2;
+    const r  = Math.max(CANVAS_W, CANVAS_H) * 0.75;
+    const vg = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  }
+
+  drawRain();
+  drawHUD();
+
+  // ── Juice: screen shake ──────────────────────────────────────────────────
+  if (_shake > 0.5) {
+    ctx.save();
+    ctx.translate(
+      (Math.random() * 2 - 1) * _shake,
+      (Math.random() * 2 - 1) * _shake
+    );
+    // Re-draw HUD on top of shake (HUD stays stable)
+    ctx.restore();
+    _shake *= 0.82;
+  }
+
+  // ── Juice: particles ─────────────────────────────────────────────────────
+  _drawParticles(ox, oy);
+
+  if (gameState === STATE.BUSTED) {
+    drawBustedScreen();
+  }
+}
+
+// ─── Juice system ───────────────────────────────────────────────────────────
+let _shake = 0;
+const _particles = [];
+
+function _spawnParticles(worldX, worldY, count, color) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1.5 + Math.random() * 3.5;
+    _particles.push({
+      x: worldX, y: worldY,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 1.0,
+      decay: 0.04 + Math.random() * 0.03,
+      r: 2 + Math.random() * 3,
+      color,
+    });
+  }
+}
+
+function _updateParticles() {
+  for (let i = _particles.length - 1; i >= 0; i--) {
+    const p = _particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vx *= 0.92;
+    p.vy *= 0.92;
+    p.life -= p.decay;
+    if (p.life <= 0) _particles.splice(i, 1);
+  }
+}
+
+function _drawParticles(ox, oy) {
+  _updateParticles();
+  for (const p of _particles) {
+    const sx = p.x - ox, sy = p.y - oy;
+    if (sx < -20 || sx > CANVAS_W + 20 || sy < -20 || sy > CANVAS_H + 20) continue;
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(sx, sy, p.r * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── Score tween ──────────────────────────────────────────────────────────────
+let _scoreDisplay = 0;
+let _scoreTarget  = 0;
+let _scoreTween   = 0; // alpha flash 0→1→0
+
+function _updateScoreTween(newEarnings) {
+  if (newEarnings !== _scoreTarget) {
+    _scoreTarget = newEarnings;
+    _scoreTween  = 1.0;
+  }
+  if (Math.abs(_scoreDisplay - _scoreTarget) > 0.5) {
+    _scoreDisplay += (_scoreTarget - _scoreDisplay) * 0.18;
+  } else {
+    _scoreDisplay = _scoreTarget;
+  }
+  if (_scoreTween > 0) _scoreTween = Math.max(0, _scoreTween - 0.06);
+}
+
+const TICK_RATE = 60;         // fixed physics Hz
+const TICK_MS   = 1000 / TICK_RATE;
+let   accumulator = 0;
+let   lastTime    = 0;
+
+function loop(timestamp) {
+  const delta = Math.min(timestamp - lastTime, 100); // cap at 100ms to prevent spiral
+  lastTime    = timestamp;
+  accumulator += delta;
+
+  while (accumulator >= TICK_MS) {
+    update();
+    accumulator -= TICK_MS;
+  }
+
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ─── Input ──────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => { keys[e.key] = true;  e.preventDefault(); });
+document.addEventListener('keyup',   e => { keys[e.key] = false; });
+document.addEventListener('click', () => {
+  if (gameState === STATE.INTRO) {
+    gameState = STATE.PLAYING;
+    Audio.init();
+    Audio.startAmbience();
+    audioStarted = true;
+  }
+});
+
+// ─── Bootstrap ──────────────────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  canvas = document.getElementById('gameCanvas');
+  ctx    = canvas.getContext('2d');
+  // Retina/HiDPI scaling
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = CANVAS_W * dpr;
+  canvas.height = CANVAS_H * dpr;
+  canvas.style.width  = CANVAS_W + 'px';
+  canvas.style.height = CANVAS_H + 'px';
+  ctx.scale(dpr, dpr);
+  initGame();
+  initRain();
+  gameState = STATE.INTRO; // Override: show intro screen before first shift
+  requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(loop); });
+});
+
+// ─── Exported Game State ────────────────────────────────────────────────────
+const Game = {
+  get state()    { return gameState; },
+  get earnings() { return earnings; },
+  get wanted()   { return wantedLevel; },
+  get dropoffs() { return dropoffs; },
+  restart()      { initGame(); },
+};
+
+// Exports visible at module level: Game, Audio, Player
+// Window exports: window.TILE, window.getTile, window.CopPatrolRoutes,
+//                 window.NearestCopDistance, window.GameState, window.CopModes
+</script>
+</body>
+</html>
