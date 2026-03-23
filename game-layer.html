@@ -123,8 +123,23 @@ let nearCopWarningTimer = 0;
 let nearestCopDist     = 999;
 
 const keys = {};
-const STATE = { PLAYING: 'PLAYING', BUSTED: 'BUSTED' };
-let gameState    = STATE.PLAYING;
+const STATE = { INTRO: 'INTRO', PLAYING: 'PLAYING', BUSTED: 'BUSTED' };
+
+// Park countdown flavor text (indexed by Math.ceil(seconds remaining), clamped 0-5)
+const PARK_FLAVOR = [
+  '✓ Services rendered.',       // 0s
+  'Checking hair in mirror...', // 1s
+  'Wrapping up...',             // 2s
+  'Delivering value...',        // 3s
+  'Providing services...',      // 4s
+  'Consulting...',              // 5s
+];
+
+// Client name roster — assigned round-robin on worker spawn
+const CLIENT_NAMES = ['ROXANNE', 'DESTINY', 'BRENDA (ACCTG)', 'MR. CHEN', 'THE GUY'];
+let clientNameIndex = 0;
+
+let gameState    = STATE.INTRO;
 let bustFlash    = 0;
 let audioStarted = false;
 
@@ -474,9 +489,13 @@ function initGame() {
   Player.vx  = 0;    Player.vy = 0;
   Player.angle = 0;  Player.speed = 0;
 
+  clientNameIndex = 0;
   workers   = [];
   for (let i = 0; i < 2; i++) {
-    workers.push(randomSidewalkPosFarFrom(Player.x, Player.y, 80));
+    const pos = randomSidewalkPosFarFrom(Player.x, Player.y, 80);
+    pos.clientName = CLIENT_NAMES[clientNameIndex % CLIENT_NAMES.length];
+    clientNameIndex++;
+    workers.push(pos);
   }
 
   dropoffPos          = null;
@@ -485,7 +504,7 @@ function initGame() {
   wantedLevel         = 0;
   cops                = [];
   pulse               = 0;
-  gameState           = STATE.PLAYING;
+  gameState           = STATE.PLAYING; // INTRO → PLAYING is handled separately
   bustFlash           = 0;
   gamePhase           = PHASE.FIND_WORKER;
   workerInCar         = false;
@@ -504,9 +523,19 @@ function initGame() {
 
 // ─── Update ─────────────────────────────────────────────────────────────────
 function update() {
+  if (gameState === STATE.INTRO) {
+    if (Object.keys(keys).some(k => keys[k])) {
+      gameState = STATE.PLAYING;
+      Audio.init();
+      Audio.startAmbience();
+      audioStarted = true;
+    }
+    return;
+  }
+
   if (gameState === STATE.BUSTED) {
     if (bustFlash > 0) bustFlash--;
-    if (keys[' '] || keys['Space']) initGame();
+    if (Object.keys(keys).some(k => keys[k])) initGame();
     return;
   }
 
@@ -609,7 +638,10 @@ function update() {
       Audio.playDropoff(dropoffEarnings);
       dropoffPos = null;
       gamePhase  = PHASE.FIND_WORKER;
-      workers.push(randomSidewalkPosFarFrom(Player.x, Player.y, 80));
+      const newWorker = randomSidewalkPosFarFrom(Player.x, Player.y, 80);
+      newWorker.clientName = CLIENT_NAMES[clientNameIndex % CLIENT_NAMES.length];
+      clientNameIndex++;
+      workers.push(newWorker);
       updateWanted();
     }
   }
@@ -939,7 +971,7 @@ function drawWaypoints(ox, oy) {
     ctx.textBaseline = 'alphabetic';
     ctx.font    = '8px monospace';
     ctx.fillStyle = '#00ff55';
-    ctx.fillText('WORKER', sx, sy - r - 4);
+    ctx.fillText(w.clientName || 'CLIENT', sx, sy - r - 4);
     ctx.restore();
   }
 
@@ -1055,7 +1087,7 @@ function drawHUD() {
     ctx.textAlign  = 'left';
     ctx.shadowColor = '#ff6600';
     ctx.shadowBlur  = 8;
-    ctx.fillText('PASSENGER: IN', 14, 46);
+    ctx.fillText('CLIENT: ABOARD', 14, 46);
     ctx.restore();
   } else if (gamePhase === PHASE.FIND_WORKER && workers.length > 0) {
     // Hint arrow toward nearest worker
@@ -1065,7 +1097,7 @@ function drawHUD() {
     ctx.fillStyle = '#00ff88';
     ctx.font      = '11px monospace';
     ctx.textAlign = 'left';
-    ctx.fillText('WORKER ' + angleToArrow(a), 14, 46);
+    ctx.fillText('CLIENT AVAILABLE ' + angleToArrow(a), 14, 46);
   }
 
   // ── Top right: wanted stars ───────────────────────────────────────────────
@@ -1080,7 +1112,7 @@ function drawHUD() {
   ctx.fillStyle = '#666666';
   ctx.font      = '11px monospace';
   ctx.textAlign = 'left';
-  ctx.fillText('NIGHT SHIFT', 14, CANVAS_H - 14);
+  ctx.fillText('NOCTURNAL TRANSIT LLC', 14, CANVAS_H - 14);
 
   // ── Bottom center: park timer HUD OR speed bar ───────────────────────────
   const BAR_W = 120, BAR_H = 8;
@@ -1101,7 +1133,8 @@ function drawHUD() {
     ctx.fillStyle   = '#aa66cc';
     ctx.font        = '10px monospace';
     ctx.textAlign   = 'center';
-    ctx.fillText('PARKED ' + Math.ceil(parkTimerRemaining) + 's', CANVAS_W/2, CANVAS_H - 10);
+    const flavorIdx = Math.min(5, Math.ceil(parkTimerRemaining));
+    ctx.fillText(PARK_FLAVOR[flavorIdx], CANVAS_W/2, CANVAS_H - 10);
   } else {
     // Normal speed bar
     const sr   = Player.speed / MAX_SPEED;
@@ -1126,6 +1159,32 @@ function angleToArrow(rad) {
   return arrows[Math.round(deg / 45) % 8];
 }
 
+function drawIntroScreen() {
+  ctx.fillStyle = 'rgba(0,0,0,0.92)';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  ctx.textAlign = 'center';
+
+  // Title
+  ctx.fillStyle = '#ffffff';
+  ctx.font      = 'bold 72px monospace';
+  ctx.save();
+  ctx.shadowColor = '#8800ff';
+  ctx.shadowBlur  = 24;
+  ctx.fillText('NIGHT SHIFT', CANVAS_W/2, CANVAS_H/2 - 50);
+  ctx.restore();
+
+  // Tagline
+  ctx.fillStyle = '#aaaacc';
+  ctx.font      = '16px monospace';
+  ctx.fillText('Premium Nocturnal Transportation Services', CANVAS_W/2, CANVAS_H/2 + 4);
+
+  // Blinking prompt
+  const blink = Math.floor(Date.now()/600) % 2 === 0;
+  ctx.fillStyle = blink ? '#00ff88' : '#005533';
+  ctx.font      = '14px monospace';
+  ctx.fillText('PRESS ANY KEY TO BEGIN SHIFT', CANVAS_W/2, CANVAS_H/2 + 52);
+}
+
 function drawBustedScreen() {
   if (bustFlash > 0) {
     ctx.fillStyle = `rgba(255,0,0,${bustFlash/30*0.7})`;
@@ -1135,22 +1194,52 @@ function drawBustedScreen() {
   ctx.fillStyle = 'rgba(0,0,0,0.85)';
   ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
   ctx.textAlign = 'center';
+
+  // Title
   ctx.fillStyle = '#ffffff';
-  ctx.font      = 'bold 72px monospace';
-  ctx.fillText('BUSTED', CANVAS_W/2, CANVAS_H/2 - 40);
+  ctx.font      = 'bold 52px monospace';
+  ctx.fillText('SERVICE TERMINATED', CANVAS_W/2, CANVAS_H/2 - 80);
+
+  // Red rule
   ctx.fillStyle = '#ff2200';
-  ctx.fillRect(CANVAS_W/2 - 160, CANVAS_H/2 - 26, 320, 3);
+  ctx.fillRect(CANVAS_W/2 - 180, CANVAS_H/2 - 58, 360, 3);
+
+  // Subtitle
+  ctx.fillStyle = '#ff4422';
+  ctx.font      = 'bold 16px monospace';
+  ctx.fillText('REGULATORY INTERVENTION', CANVAS_W/2, CANVAS_H/2 - 38);
+
+  // Body text
+  ctx.fillStyle = '#cccccc';
+  ctx.font      = '13px monospace';
+  ctx.fillText('Officer Schmidt has some questions.', CANVAS_W/2, CANVAS_H/2 - 8);
+  ctx.fillText('You explain that you operate a premium nocturnal transportation service.', CANVAS_W/2, CANVAS_H/2 + 12);
+  ctx.fillText('Officer Schmidt does not find this compelling.', CANVAS_W/2, CANVAS_H/2 + 32);
+
+  // Earnings
   ctx.fillStyle = '#00ff55';
-  ctx.font      = 'bold 24px monospace';
-  ctx.fillText('TOTAL EARNINGS: $' + earnings, CANVAS_W/2, CANVAS_H/2 + 20);
+  ctx.font      = 'bold 20px monospace';
+  ctx.fillText('TOTAL REVENUE: $' + earnings, CANVAS_W/2, CANVAS_H/2 + 62);
+
+  // Blink restart + lawyer gag
   const blink = Math.floor(Date.now()/500) % 2 === 0;
   ctx.fillStyle = blink ? '#ffffff' : '#888888';
-  ctx.font      = '16px monospace';
-  ctx.fillText('PRESS SPACE TO RESTART', CANVAS_W/2, CANVAS_H/2 + 60);
+  ctx.font      = '15px monospace';
+  ctx.fillText('PRESS SPACE TO RESUME OPERATIONS', CANVAS_W/2, CANVAS_H/2 + 94);
+  ctx.fillStyle = blink ? '#aaaaaa' : '#555555';
+  ctx.font      = '13px monospace';
+  ctx.fillText('[ CALL A LAWYER ]', CANVAS_W/2, CANVAS_H/2 + 116);
 }
 
 // ─── Main Loop ──────────────────────────────────────────────────────────────
 function render() {
+  if (gameState === STATE.INTRO) {
+    ctx.fillStyle = COLOR.BG;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    drawIntroScreen();
+    return;
+  }
+
   const { ox, oy } = getCameraOffset();
 
   ctx.fillStyle = COLOR.BG;
@@ -1221,6 +1310,7 @@ window.addEventListener('load', () => {
   canvas = document.getElementById('gameCanvas');
   ctx    = canvas.getContext('2d');
   initGame();
+  gameState = STATE.INTRO; // Override: show intro screen before first shift
   requestAnimationFrame(loop);
 });
 
