@@ -1370,6 +1370,11 @@ function initGame() {
   dropoffPos          = null;
   earnings            = 0;
   dropoffs            = 0;
+  _scoreDisplay       = 0;
+  _scoreTarget        = 0;
+  _scoreTween         = 0;
+  _shake              = 0;
+  _particles.length   = 0;
   wantedLevel         = 0;
   cops                = [];
   pulse               = 0;
@@ -1478,8 +1483,9 @@ function update() {
         workers.splice(i, 1);
         workerInCar = true;
         gamePhase   = PHASE.HAS_WORKER;
-        pickupTime  = Date.now(); // v2: track pickup time for speed bonus
+        pickupTime  = Date.now();
         Audio.playPickup();
+        _spawnParticles(Player.x, Player.y, 12, '#00ff88');
         break;
       }
     }
@@ -1559,7 +1565,9 @@ function update() {
     if (dropoffPos && dist(Player.x, Player.y, dropoffPos.x, dropoffPos.y) < DROP_RADIUS) {
       earnings  += dropoffEarnings;
       dropoffs++;
+      _updateScoreTween(earnings);
       Audio.playDropoff(dropoffEarnings);
+      _spawnParticles(Player.x, Player.y, 18, '#ffee00');
       dropoffPos = null;
       gamePhase  = PHASE.FIND_WORKER;
       const newWorker = randomSidewalkPosFarFrom(Player.x, Player.y, 80);
@@ -1738,6 +1746,8 @@ function update() {
     if (workerInCar && !isParked && pd < COP_BUST_RADIUS) {
       gameState = STATE.BUSTED;
       bustFlash = 30;
+      _shake = 14;
+      _spawnParticles(Player.x, Player.y, 20, '#ff2200');
       Audio.setCopSiren(0);
       Audio.setParkState(false);
       Audio.playBust();
@@ -2119,7 +2129,13 @@ function drawHUD() {
   ctx.fillStyle = '#00ff55';
   ctx.font      = 'bold 20px monospace';
   ctx.textAlign = 'left';
-  ctx.fillText('$' + earnings, 14, 28);
+  // Score tween: flash white briefly on earn
+  if (_scoreTween > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${_scoreTween * 0.7})`;
+    ctx.fillRect(8, 8, 90, 26);
+  }
+  ctx.fillStyle = '#00ff55';
+  ctx.fillText('$' + Math.round(_scoreDisplay), 14, 28);
 
   // ── Passenger status ─────────────────────────────────────────────────────
   if (workerInCar || isParked || isExposedParked) {
@@ -2387,9 +2403,89 @@ function render() {
 
   drawHUD();
 
+  // ── Juice: screen shake ──────────────────────────────────────────────────
+  if (_shake > 0.5) {
+    ctx.save();
+    ctx.translate(
+      (Math.random() * 2 - 1) * _shake,
+      (Math.random() * 2 - 1) * _shake
+    );
+    // Re-draw HUD on top of shake (HUD stays stable)
+    ctx.restore();
+    _shake *= 0.82;
+  }
+
+  // ── Juice: particles ─────────────────────────────────────────────────────
+  _drawParticles(ox, oy);
+
   if (gameState === STATE.BUSTED) {
     drawBustedScreen();
   }
+}
+
+// ─── Juice system ───────────────────────────────────────────────────────────
+let _shake = 0;
+const _particles = [];
+
+function _spawnParticles(worldX, worldY, count, color) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1.5 + Math.random() * 3.5;
+    _particles.push({
+      x: worldX, y: worldY,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 1.0,
+      decay: 0.04 + Math.random() * 0.03,
+      r: 2 + Math.random() * 3,
+      color,
+    });
+  }
+}
+
+function _updateParticles() {
+  for (let i = _particles.length - 1; i >= 0; i--) {
+    const p = _particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vx *= 0.92;
+    p.vy *= 0.92;
+    p.life -= p.decay;
+    if (p.life <= 0) _particles.splice(i, 1);
+  }
+}
+
+function _drawParticles(ox, oy) {
+  _updateParticles();
+  for (const p of _particles) {
+    const sx = p.x - ox, sy = p.y - oy;
+    if (sx < -20 || sx > CANVAS_W + 20 || sy < -20 || sy > CANVAS_H + 20) continue;
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(sx, sy, p.r * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── Score tween ──────────────────────────────────────────────────────────────
+let _scoreDisplay = 0;
+let _scoreTarget  = 0;
+let _scoreTween   = 0; // alpha flash 0→1→0
+
+function _updateScoreTween(newEarnings) {
+  if (newEarnings !== _scoreTarget) {
+    _scoreTarget = newEarnings;
+    _scoreTween  = 1.0;
+  }
+  if (Math.abs(_scoreDisplay - _scoreTarget) > 0.5) {
+    _scoreDisplay += (_scoreTarget - _scoreDisplay) * 0.18;
+  } else {
+    _scoreDisplay = _scoreTarget;
+  }
+  if (_scoreTween > 0) _scoreTween = Math.max(0, _scoreTween - 0.06);
 }
 
 const TICK_RATE = 60;         // fixed physics Hz
