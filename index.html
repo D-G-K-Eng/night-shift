@@ -88,6 +88,7 @@ const Audio = (() => {
     _buildEngine();
     _buildSiren();
     _buildProximityRumble();
+    _buildSearchState();
     _buildWantedLayers();
   }
 
@@ -324,6 +325,51 @@ const Audio = (() => {
       } else {
         layer.stop();
       }
+    }
+  }
+
+  // ─── Cop Search State Audio ───────────────────────────────────────────────
+  // Plays when a cop enters "search sweep" mode after losing sight of the player.
+  // Distinct from siren (spotted) and patrol (safe) — the "hunting" middle state.
+  // Sound: slow LFO sweep on a low sine band (80-180Hz), 3s cycle.
+  // Call: Audio.setCopSearchState(true/false)
+  let searchOsc = null, searchLFO = null, searchGain = null;
+  let _searching = false;
+
+  function _buildSearchState() {
+    // Base tone — mid-low sine, amplitude modulated by LFO
+    searchOsc = ctx.createOscillator();
+    searchOsc.type = 'sine';
+    searchOsc.frequency.setValueAtTime(110, ctx.currentTime); // A2
+
+    // LFO sweeps the filter frequency (80-180Hz range) — slow, ominous
+    searchLFO = ctx.createOscillator();
+    searchLFO.type = 'sine';
+    searchLFO.frequency.setValueAtTime(0.33, ctx.currentTime); // 3s cycle
+
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.setValueAtTime(50, ctx.currentTime); // ±50Hz sweep on the base freq
+    searchLFO.connect(lfoGain);
+    lfoGain.connect(searchOsc.frequency);
+
+    searchGain = ctx.createGain();
+    searchGain.gain.setValueAtTime(0, ctx.currentTime); // silent until activated
+
+    searchOsc.connect(searchGain);
+    searchGain.connect(masterGain);
+    searchOsc.start();
+    searchLFO.start();
+  }
+
+  function setCopSearchState(active) {
+    if (!ctx || !searchGain) return;
+    _searching = active;
+    if (active) {
+      // Fade in slowly — the threat materialises
+      searchGain.gain.linearRampToValueAtTime(0.09, ctx.currentTime + 1.2);
+    } else {
+      // Fade out — they've given up, back to patrol
+      searchGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 2.5);
     }
   }
 
@@ -605,7 +651,7 @@ const Audio = (() => {
     src.start(t2); src.stop(t2 + 0.05);
   }
 
-  return { init, setEngineSpeed, playPickup, playDropoff, setCopSiren, startAmbience, startPornoMusic, stopPornoMusic, setParkState, setCopProximity };
+  return { init, setEngineSpeed, playPickup, playDropoff, setCopSiren, startAmbience, startPornoMusic, stopPornoMusic, setParkState, setCopProximity, setCopSearchState };
 })();
 
 </script>
