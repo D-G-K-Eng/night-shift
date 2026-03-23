@@ -79,6 +79,7 @@ const PARK_SPEED_THRESHOLD  = 0.3;
 const PARK_TIMER_DURATION   = 5;    // seconds
 const COP_PATROL_SPEED      = 1.5;
 const COP_CHASE_SPEED       = 2.8;
+const COP_SEARCH_SPEED      = 2.0;
 const PATROL_REACH          = 16;   // px to advance patrol index
 const DROPOFF_MIN_DIST      = 50;
 const DROPOFF_MAX_DIST      = 200;
@@ -138,6 +139,7 @@ window.getTile = function(worldX, worldY) {
 
 window.CopPatrolRoutes    = [];  // [[{x,y},...], ...] one per cop
 window.NearestCopDistance = 999; // live px
+window.CopModes           = [];  // live array: cops.map(c => c.mode)
 
 window.GameState = {
   get parked()      { return isParked; },
@@ -270,6 +272,25 @@ function randomRoadPosFarFrom(px, py, minDist) {
   return pos;
 }
 
+function randomRoadPosNear(px, py, radius) {
+  // Pick a random road tile within `radius` px of (px, py)
+  let tries = 0;
+  while (tries < 200) {
+    const angle = Math.random() * Math.PI * 2;
+    const r     = 20 + Math.random() * radius;
+    const wx    = px + Math.cos(angle) * r;
+    const wy    = py + Math.sin(angle) * r;
+    const tx    = Math.floor(wx / TILE_SIZE);
+    const ty    = Math.floor(wy / TILE_SIZE);
+    if (tilePassable(tx, ty)) {
+      return { x: tx * TILE_SIZE + TILE_SIZE / 2, y: ty * TILE_SIZE + TILE_SIZE / 2 };
+    }
+    tries++;
+  }
+  // fallback: any road tile
+  return randomRoadPos();
+}
+
 function randomRoadPosBetween(px, py, minD, maxD) {
   let pos, tries = 0;
   do {
@@ -318,6 +339,55 @@ function carOverlapsBuilding(cx, cy) {
     .some(([x,y]) => isBuildingAt(x,y));
 }
 
+// ─── Park Cop Nudge ──────────────────────────────────────────────────────────
+let parkNudgeTimer = 0; // counts down frames; removes temp waypoints at 0
+
+function triggerParkCopNudge() {
+  // Pick the non-CHASE cop closest to the player
+  let bestCop  = null;
+  let bestDist = Infinity;
+  for (const c of cops) {
+    if (c.mode === 'CHASE') continue;
+    const d = dist(c.x, c.y, Player.x, Player.y);
+    if (d < bestDist) { bestDist = d; bestCop = c; }
+  }
+  if (!bestCop) return;
+
+  // Pick a road tile 80-100px from the player in a random direction
+  let nudgePt = null;
+  for (let tries = 0; tries < 200; tries++) {
+    const angle = Math.random() * Math.PI * 2;
+    const r     = 80 + Math.random() * 20; // 80-100px
+    const wx    = Player.x + Math.cos(angle) * r;
+    const wy    = Player.y + Math.sin(angle) * r;
+    const tx    = Math.floor(wx / TILE_SIZE);
+    const ty    = Math.floor(wy / TILE_SIZE);
+    if (tilePassable(tx, ty)) {
+      nudgePt = { x: tx * TILE_SIZE + TILE_SIZE / 2, y: ty * TILE_SIZE + TILE_SIZE / 2, isTemp: true };
+      break;
+    }
+  }
+  if (!nudgePt) return;
+
+  // Insert at the FRONT of patrolPoints
+  bestCop.patrolPoints.unshift(nudgePt);
+  bestCop.patrolIndex      = 0;
+  bestCop.usingTempWaypoint = true;
+  parkNudgeTimer = 360; // 6 seconds
+}
+
+// ─── Cop Export Update ──────────────────────────────────────────────────────
+function updateCopExports() {
+  window.CopModes = cops.map(c => c.mode);
+  window.CopPatrolRoutes = cops.map(c => {
+    const route = c.patrolPoints.slice();
+    if (c.mode === 'SEARCH') {
+      route.unshift({ x: c.lastKnownX, y: c.lastKnownY, isLastKnown: true });
+    }
+    return route;
+  });
+}
+
 // ─── Cop Patrol Generation ───────────────────────────────────────────────────
 function generatePatrolRoute(startX, startY, n) {
   const route = [];
@@ -343,10 +413,17 @@ function spawnCops(targetCount) {
       patrolPoints: patrol,
       patrolIndex:  0,
       mode: 'PATROL',
+      // SEARCH state fields
+      lastKnownX: 0,
+      lastKnownY: 0,
+      searchTimer: 0,
+      searchTarget: null,
+      // temp waypoint state
+      usingTempWaypoint: false,
     });
   }
   while (cops.length > targetCount) cops.pop();
-  window.CopPatrolRoutes = cops.map(c => c.patrolPoints.slice());
+  updateCopExports();
 }
 
 function updateWanted() {
@@ -393,6 +470,8 @@ function initGame() {
   nearestCopDist      = 999;
 
   window.NearestCopDistance = 999;
+  window.CopModes           = [];
+  parkNudgeTimer            = 0;
   spawnCops(INITIAL_COP_COUNT);
 }
 
@@ -469,8 +548,19 @@ function update() {
       parkTimerRemaining = PARK_TIMER_DURATION;
       Player.vx = 0; Player.vy = 0;
       Audio.setParkState(true);
-      // Hidden spot — cops go blind
-      for (const c of cops) c.mode = 'PATROL';
+      // Hidden spot: CHASE cops → SEARCH, PATROL cops stay PATROL
+      for (const c of cops) {
+        if (c.mode === 'CHASE') {
+          c.lastKnownX  = Player.x;
+          c.lastKnownY  = Player.y;
+          c.searchTimer = 720; // 12 * 60 frames
+          c.searchTarget = null;
+          c.mode        = 'SEARCH';
+        }
+        // PATROL stays PATROL
+      }
+      // Park window cop nudge: pick closest non-CHASE cop and give temp waypoint
+      triggerParkCopNudge();
     }
 
   } else if (gamePhase === PHASE.PARKED) {
@@ -497,6 +587,24 @@ function update() {
     }
   }
 
+  // ── Park nudge timer ──────────────────────────────────────────────────────
+  if (parkNudgeTimer > 0) {
+    parkNudgeTimer--;
+    if (parkNudgeTimer === 0) {
+      // Remove temp waypoints from all cops
+      for (const c of cops) {
+        if (c.usingTempWaypoint) {
+          // Remove the first temp waypoint from patrolPoints
+          const idx = c.patrolPoints.findIndex(p => p.isTemp);
+          if (idx !== -1) c.patrolPoints.splice(idx, 1);
+          // Keep patrolIndex in bounds
+          if (c.patrolIndex >= c.patrolPoints.length) c.patrolIndex = 0;
+          c.usingTempWaypoint = false;
+        }
+      }
+    }
+  }
+
   // ── Cop AI ────────────────────────────────────────────────────────────────
   nearestCopDist = 999;
 
@@ -504,26 +612,96 @@ function update() {
     const pd = dist(cop.x, cop.y, Player.x, Player.y);
     if (pd < nearestCopDist) nearestCopDist = pd;
 
-    // Mode switching — cops blind inside hidden park
-    if (!isParked) {
-      if (workerInCar && pd < COP_CHASE_RADIUS) {
+    // ── Mode switching ────────────────────────────────────────────────────
+    if (cop.mode === 'CHASE') {
+      if (isParked) {
+        // Player just parked (hidden) — transition to SEARCH
+        cop.lastKnownX  = Player.x;
+        cop.lastKnownY  = Player.y;
+        cop.searchTimer = 720;
+        cop.searchTarget = null;
+        cop.mode        = 'SEARCH';
+      } else if (!workerInCar || pd > COP_CHASE_RADIUS * 2) {
+        // Lost sight of player (drove away or dropped worker)
+        cop.lastKnownX  = Player.x;
+        cop.lastKnownY  = Player.y;
+        cop.searchTimer = 720;
+        cop.searchTarget = null;
+        cop.mode        = 'SEARCH';
+      }
+    } else if (cop.mode === 'SEARCH') {
+      // Can re-enter CHASE if player is visible (worker in car, not parked, close)
+      if (!isParked && workerInCar && pd < COP_CHASE_RADIUS) {
         cop.mode = 'CHASE';
-      } else if (cop.mode === 'CHASE' && pd > COP_CHASE_RADIUS * 2) {
-        cop.mode = 'PATROL'; // lost sight
+      }
+    } else {
+      // PATROL: can enter CHASE only if player is visible (not parked, worker in car)
+      if (!isParked && workerInCar && pd < COP_CHASE_RADIUS) {
+        cop.mode = 'CHASE';
       }
     }
 
+    // ── Movement by mode ──────────────────────────────────────────────────
     if (cop.mode === 'PATROL') {
-      const tgt = cop.patrolPoints[cop.patrolIndex];
-      const dx  = tgt.x - cop.x, dy = tgt.y - cop.y;
-      const d   = Math.sqrt(dx*dx + dy*dy);
-      if (d < PATROL_REACH) {
-        cop.patrolIndex = (cop.patrolIndex + 1) % cop.patrolPoints.length;
-      } else {
-        cop.vx    = (dx/d) * COP_PATROL_SPEED;
-        cop.vy    = (dy/d) * COP_PATROL_SPEED;
-        cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+      if (cop.patrolPoints.length === 0) { cop.vx = 0; cop.vy = 0; }
+      else {
+        const tgt = cop.patrolPoints[cop.patrolIndex];
+        const dx  = tgt.x - cop.x, dy = tgt.y - cop.y;
+        const d   = Math.sqrt(dx*dx + dy*dy);
+        if (d < PATROL_REACH) {
+          // Advance; if we reached a temp waypoint, clear it
+          if (tgt.isTemp && cop.usingTempWaypoint) {
+            cop.patrolPoints.splice(cop.patrolIndex, 1);
+            cop.usingTempWaypoint = false;
+            if (cop.patrolPoints.length === 0) { cop.vx = 0; cop.vy = 0; }
+            else cop.patrolIndex = cop.patrolIndex % cop.patrolPoints.length;
+          } else {
+            cop.patrolIndex = (cop.patrolIndex + 1) % cop.patrolPoints.length;
+          }
+        } else {
+          cop.vx    = (dx/d) * COP_PATROL_SPEED;
+          cop.vy    = (dy/d) * COP_PATROL_SPEED;
+          cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+        }
       }
+
+    } else if (cop.mode === 'SEARCH') {
+      cop.searchTimer--;
+
+      if (cop.searchTimer <= 0) {
+        cop.mode = 'PATROL';
+        cop.searchTarget = null;
+      } else {
+        const isNearHiddenPark = isParked && dist(cop.x, cop.y, Player.x, Player.y) < 40;
+
+        // Pick a target: either lastKnown or a sweep tile
+        if (!cop.searchTarget) {
+          const dToLK = dist(cop.x, cop.y, cop.lastKnownX, cop.lastKnownY);
+          if (dToLK > 32) {
+            cop.searchTarget = { x: cop.lastKnownX, y: cop.lastKnownY };
+          } else {
+            // Arrived at lastKnown — sweep nearby road tiles
+            cop.searchTarget = randomRoadPosNear(cop.lastKnownX, cop.lastKnownY, 80);
+          }
+        }
+
+        // If near hidden park, just mill around — don't bust
+        if (isNearHiddenPark) {
+          cop.searchTarget = randomRoadPosNear(cop.x, cop.y, 60);
+        }
+
+        const dx = cop.searchTarget.x - cop.x;
+        const dy = cop.searchTarget.y - cop.y;
+        const d  = Math.sqrt(dx*dx + dy*dy);
+        if (d < PATROL_REACH) {
+          cop.searchTarget = null; // pick a new one next frame
+        } else {
+          cop.vx    = (dx/d) * COP_SEARCH_SPEED;
+          cop.vy    = (dy/d) * COP_SEARCH_SPEED;
+          cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+        }
+      }
+
     } else {
       // CHASE
       const dx = Player.x - cop.x, dy = Player.y - cop.y;
@@ -534,6 +712,7 @@ function update() {
         cop.angle = Math.atan2(dx, -dy) * 180 / Math.PI;
       }
     }
+
     cop.x += cop.vx;
     cop.y += cop.vy;
 
@@ -549,6 +728,7 @@ function update() {
 
   window.NearestCopDistance = nearestCopDist;
   Audio.setCopProximity(nearestCopDist);
+  updateCopExports();
 
   // Near-cop warning while parked (visual stress, no bust)
   if (isParked && nearestCopDist < COP_NEAR_PARK_RADIUS) nearCopWarningTimer = 30;
@@ -957,7 +1137,7 @@ const Game = {
 
 // Exports visible at module level: Game, Audio, Player
 // Window exports: window.TILE, window.getTile, window.CopPatrolRoutes,
-//                 window.NearestCopDistance, window.GameState
+//                 window.NearestCopDistance, window.GameState, window.CopModes
 </script>
 </body>
 </html>
