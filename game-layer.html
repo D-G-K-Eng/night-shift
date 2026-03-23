@@ -33,6 +33,7 @@ const Audio = {
   startAmbience() {},
   setParkState(parked) {},             // called when entering/exiting park state
   setCopProximity(distance) {},        // called each frame with nearest cop distance (999 if no cops)
+  setExposedParkState(parked) {},      // called when entering/exiting exposed park
 };
 
 // ─── Constants ─────────────────────────────────────────────────────────────
@@ -121,6 +122,9 @@ let parkTimerRemaining = 0;
 let dropoffEarnings    = 0;
 let nearCopWarningTimer = 0;
 let nearestCopDist     = 999;
+let heatPoints         = 0;
+let cleanTimer         = 0;  // seconds of clean driving (no cop in CHASE)
+let pickupTime         = 0;
 
 const keys = {};
 const STATE = { INTRO: 'INTRO', PLAYING: 'PLAYING', BUSTED: 'BUSTED' };
@@ -157,9 +161,10 @@ window.NearestCopDistance = 999; // live px
 window.CopModes           = [];  // live array: cops.map(c => c.mode)
 
 window.GameState = {
-  get parked()      { return isParked; },
-  get parkTimer()   { return parkTimerRemaining; },
-  get workerInCar() { return workerInCar; },
+  get parked()       { return isParked; },
+  get parkTimer()    { return parkTimerRemaining; },
+  get workerInCar()  { return workerInCar; },
+  get parkExposed()  { return gamePhase === 'EXPOSED_PARK'; },
 };
 
 // ─── Tile Helpers ───────────────────────────────────────────────────────────
@@ -469,10 +474,7 @@ function spawnCops(targetCount) {
 }
 
 function updateWanted() {
-  let lvl = 0;
-  for (let i = 0; i < STAR_THRESHOLDS.length; i++) {
-    if (dropoffs >= STAR_THRESHOLDS[i]) lvl = i + 1;
-  }
+  const lvl = heatPoints >= 6 ? 3 : heatPoints >= 3 ? 2 : heatPoints > 0 ? 1 : 0;
   if (lvl !== wantedLevel) {
     wantedLevel = lvl;
     Audio.setCopSiren(wantedLevel);
@@ -514,6 +516,9 @@ function initGame() {
   dropoffEarnings     = 0;
   nearCopWarningTimer = 0;
   nearestCopDist      = 999;
+  heatPoints          = 0;
+  cleanTimer          = 0;
+  pickupTime          = 0;
 
   window.NearestCopDistance = 999;
   window.CopModes           = [];
@@ -586,6 +591,7 @@ function update() {
       if (dist(Player.x, Player.y, workers[i].x, workers[i].y) < WORKER_PICKUP_RADIUS) {
         workers.splice(i, 1);
         workerInCar = true;
+        pickupTime  = Date.now();
         gamePhase   = PHASE.HAS_WORKER;
         Audio.playPickup();
         break;
@@ -627,14 +633,19 @@ function update() {
       workerInCar = false;
       gamePhase   = PHASE.DROPOFF;
       Audio.setParkState(false);
-      dropoffEarnings = MIN_EARNINGS + Math.floor(Math.random() * (MAX_EARNINGS - MIN_EARNINGS + 1));
+      dropoffEarnings = 15; // placeholder; final calc at drop-off
       dropoffPos  = randomRoadPosBetween(Player.x, Player.y, DROPOFF_MIN_DIST, DROPOFF_MAX_DIST);
     }
 
   } else if (gamePhase === PHASE.DROPOFF) {
     if (dropoffPos && dist(Player.x, Player.y, dropoffPos.x, dropoffPos.y) < DROP_RADIUS) {
+      const elapsed = (Date.now() - pickupTime) / 1000;
+      const speedBonus = Math.max(-15, Math.min(30, Math.round(30 - elapsed)));
+      dropoffEarnings = 15 + Math.max(0, speedBonus);
       earnings  += dropoffEarnings;
       dropoffs++;
+      heatPoints = Math.max(0, heatPoints - 1);
+      cleanTimer = 0;
       Audio.playDropoff(dropoffEarnings);
       dropoffPos = null;
       gamePhase  = PHASE.FIND_WORKER;
@@ -691,11 +702,13 @@ function update() {
     } else if (cop.mode === 'SEARCH') {
       // Can re-enter CHASE if player is visible (worker in car, not parked, close)
       if (!isParked && workerInCar && pd < COP_CHASE_RADIUS) {
+        if (cop.mode !== 'CHASE') { heatPoints++; cleanTimer = 0; updateWanted(); }
         cop.mode = 'CHASE';
       }
     } else {
       // PATROL: can enter CHASE only if player is visible (not parked, worker in car)
       if (!isParked && workerInCar && pd < COP_CHASE_RADIUS) {
+        if (cop.mode !== 'CHASE') { heatPoints++; cleanTimer = 0; updateWanted(); }
         cop.mode = 'CHASE';
       }
     }
@@ -786,6 +799,16 @@ function update() {
   }
 
   window.NearestCopDistance = nearestCopDist;
+
+  // Heat decay: 30s clean driving removes 1 heat point
+  const anyCopChasing = cops.some(c => c.mode === 'CHASE');
+  if (!anyCopChasing && heatPoints > 0) {
+    cleanTimer += 1/60;
+    if (cleanTimer >= 30) { heatPoints = Math.max(0, heatPoints - 1); cleanTimer = 0; updateWanted(); }
+  } else if (anyCopChasing) {
+    cleanTimer = 0;
+  }
+
   Audio.setCopProximity(nearestCopDist);
   updateCopExports();
 
@@ -1067,7 +1090,7 @@ function drawParkCountdown(screenX, screenY) {
   ctx.font         = 'bold 11px monospace';
   ctx.textAlign    = 'center';
   ctx.textBaseline = 'middle';
-  const _fi = Math.min(5, Math.ceil(parkTimerRemaining)); ctx.font = "bold 9px monospace"; ctx.fillText(PARK_FLAVOR[_fi], screenX, screenY);
+  ctx.fillText(Math.ceil(parkTimerRemaining) + 's', screenX, screenY);
   ctx.textBaseline = 'alphabetic';
   ctx.restore();
 }
