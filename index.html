@@ -599,46 +599,69 @@ const Audio = (() => {
     pornoRunning = false;
   }
 
-  // ─── Pickup / Dropoff jingles ─────────────────────────────────────────────
+  // ─── Stings & Jingles ────────────────────────────────────────────────────
+  // All music-responsive cues — the porno music is now the narrator.
+
   function playPickup() {
     if (!ctx) return;
-    // Ascending 3-note major chime: C5, E5, G5
-    [523.25, 659.25, 783.99].forEach((freq, i) => {
+    // Wah guitar stab on pickup — new client acquired. Professionally.
+    // Single chord hit (Eb maj) through auto-wah, punchy attack.
+    const CHORD = [155.56, 195.99, 233.08]; // Eb3, G3, Bb3
+    CHORD.forEach((freq, vi) => {
       const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      osc.type = 'sine';
+      osc.type = 'sawtooth';
       osc.frequency.setValueAtTime(freq, ctx.currentTime);
-      const t = ctx.currentTime + i * 0.1;
-      g.gain.setValueAtTime(0, t);
-      g.gain.linearRampToValueAtTime(0.18, t + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
-      osc.connect(g); g.connect(masterGain);
-      osc.start(t); osc.stop(t + 0.35);
+      osc.detune.setValueAtTime((vi - 1) * 10, ctx.currentTime);
+
+      const wah = ctx.createBiquadFilter();
+      wah.type = 'bandpass';
+      wah.Q.setValueAtTime(10, ctx.currentTime);
+      wah.frequency.setValueAtTime(300, ctx.currentTime);
+      wah.frequency.linearRampToValueAtTime(2800, ctx.currentTime + 0.08);
+      wah.frequency.exponentialRampToValueAtTime(500, ctx.currentTime + 0.3);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, ctx.currentTime);
+      g.gain.linearRampToValueAtTime(0.14, ctx.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.32);
+
+      osc.connect(wah); wah.connect(g); g.connect(masterGain);
+      osc.start(); osc.stop(ctx.currentTime + 0.38);
     });
   }
 
   function playDropoff(earningsAmt) {
     if (!ctx) return;
-    // Reversed chime (descending) + cash register tick
-    [783.99, 659.25, 523.25].forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(freq, ctx.currentTime);
-      const t = ctx.currentTime + i * 0.08;
-      g.gain.setValueAtTime(0, t);
-      g.gain.linearRampToValueAtTime(0.16, t + 0.015);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
-      osc.connect(g); g.connect(masterGain);
-      osc.start(t); osc.stop(t + 0.3);
+    // Triumphant horn fanfare — one measure, slightly ridiculous.
+    // Rising 4-note brass figure (Eb, G, Bb, Eb up) + cash register.
+    const FANFARE = [155.56, 195.99, 233.08, 311.13]; // Eb3→Eb4 major arp
+    FANFARE.forEach((freq, i) => {
+      const t = ctx.currentTime + i * 0.1;
+      // Two-voice brass
+      [freq, freq * 1.25].forEach((f, vi) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(f, t);
+        osc.detune.setValueAtTime(vi * 8, t);
+        const filt = ctx.createBiquadFilter();
+        filt.type = 'lowpass';
+        filt.frequency.setValueAtTime(2800, t);
+        filt.frequency.exponentialRampToValueAtTime(900, t + 0.18);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.10, t + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+        osc.connect(filt); filt.connect(g); g.connect(masterGain);
+        osc.start(t); osc.stop(t + 0.25);
+      });
     });
 
-    // Cash register tick — short metallic click
-    const t2 = ctx.currentTime + 0.25;
+    // Cash register tick — the money is real
+    const t2 = ctx.currentTime + 0.45;
     const bufLen = Math.floor(ctx.sampleRate * 0.03);
     const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
     const d = buf.getChannelData(0);
-    for (let i = 0; i < bufLen; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufLen * 0.3));
+    for (let i = 0; i < bufLen; i++) d[i] = (Math.random()*2-1) * Math.exp(-i/(bufLen*0.3));
     const src = ctx.createBufferSource();
     src.buffer = buf;
     const f = ctx.createBiquadFilter();
@@ -646,12 +669,72 @@ const Audio = (() => {
     f.frequency.setValueAtTime(3000, t2);
     f.Q.setValueAtTime(1, t2);
     const g2 = ctx.createGain();
-    g2.gain.setValueAtTime(0.25, t2);
+    g2.gain.setValueAtTime(0.28, t2);
     src.connect(f); f.connect(g2); g2.connect(masterGain);
     src.start(t2); src.stop(t2 + 0.05);
   }
 
-  return { init, setEngineSpeed, playPickup, playDropoff, setCopSiren, startAmbience, startPornoMusic, stopPornoMusic, setParkState, setCopProximity, setCopSearchState };
+  // Sad trombone — bust screen. Service terminated. Regulatory intervention.
+  function playBust() {
+    if (!ctx) return;
+    // Three descending notes: Bb3, G3, Eb3 — slow, defeated, filtered cheap.
+    const NOTES = [233.08, 195.99, 155.56];
+    NOTES.forEach((freq, i) => {
+      const t = ctx.currentTime + i * 0.45;
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq * 1.02, t); // slight slide down
+      osc.frequency.linearRampToValueAtTime(freq * 0.97, t + 0.4);
+
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'lowpass';
+      filt.frequency.setValueAtTime(1200, t);
+      filt.frequency.linearRampToValueAtTime(500, t + 0.4);
+      filt.Q.setValueAtTime(3, t);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.2, t + 0.04);
+      g.gain.linearRampToValueAtTime(0.18, t + 0.3);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.44);
+
+      osc.connect(filt); filt.connect(g); g.connect(masterGain);
+      osc.start(t); osc.stop(t + 0.5);
+    });
+
+    // Stop porno music on bust — the silence is the punchline
+    stopPornoMusic();
+  }
+
+  // Transaction complete — park timer hit zero. Satisfied saxophone-ish phrase.
+  // Two-note resolution: Bb3 → Eb4. Smooth, smug.
+  function playTransactionComplete() {
+    if (!ctx) return;
+    [[233.08, 0], [311.13, 0.25]].forEach(([freq, delay]) => {
+      const t = ctx.currentTime + delay;
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq, t);
+
+      // Sax-ish: LP filter with slight resonance, slow attack
+      const filt = ctx.createBiquadFilter();
+      filt.type = 'lowpass';
+      filt.frequency.setValueAtTime(1800, t);
+      filt.frequency.linearRampToValueAtTime(800, t + 0.3);
+      filt.Q.setValueAtTime(4, t);
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.15, t + 0.06); // slow sax attack
+      g.gain.linearRampToValueAtTime(0.12, t + 0.25);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.45);
+
+      osc.connect(filt); filt.connect(g); g.connect(masterGain);
+      osc.start(t); osc.stop(t + 0.5);
+    });
+  }
+
+  return { init, setEngineSpeed, playPickup, playDropoff, playBust, playTransactionComplete, setCopSiren, startAmbience, startPornoMusic, stopPornoMusic, setParkState, setCopProximity, setCopSearchState };
 })();
 
 </script>
@@ -1109,6 +1192,7 @@ function update() {
       workerInCar = false;
       gamePhase   = PHASE.DROPOFF;
       Audio.setParkState(false);
+      Audio.playTransactionComplete();
       dropoffEarnings = MIN_EARNINGS + Math.floor(Math.random() * (MAX_EARNINGS - MIN_EARNINGS + 1));
       dropoffPos  = randomRoadPosBetween(Player.x, Player.y, DROPOFF_MIN_DIST, DROPOFF_MAX_DIST);
     }
@@ -1171,6 +1255,7 @@ function update() {
       bustFlash = 30;
       Audio.setCopSiren(0);
       Audio.setParkState(false);
+      Audio.playBust();
       return;
     }
   }
