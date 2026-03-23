@@ -15,7 +15,7 @@
     overflow: hidden;
     font-family: monospace;
   }
-  canvas { display: block; image-rendering: pixelated; }
+  canvas { display: block; image-rendering: pixelated; filter: contrast(1.1) brightness(0.92) saturate(1.15); }
 </style>
 </head>
 <body>
@@ -43,9 +43,9 @@ const TILE_SIZE  = 32;
 const CITY_TILES = 40;
 const CITY_SIZE  = CITY_TILES * TILE_SIZE; // 1280px
 
-const BLOCK_SIZE = 4;
+const BLOCK_SIZE = 3;
 const ROAD_WIDTH = 2;
-const PERIOD     = BLOCK_SIZE + ROAD_WIDTH; // 6 tiles per period
+const PERIOD     = BLOCK_SIZE + ROAD_WIDTH; // 5 tiles per period
 
 // Tile types
 const TILE = { ROAD: 0, BUILDING: 1, SIDEWALK: 2, HIDDEN_PARK: 3 };
@@ -221,8 +221,14 @@ function generateMap() {
       if (map[y][x] !== TILE.BUILDING) continue;
       for (let wy = 4; wy < TILE_SIZE - 4; wy += 6) {
         for (let wx = 4; wx < TILE_SIZE - 4; wx += 6) {
-          if (rng() < 0.30) {
-            windows.push({ px: x*TILE_SIZE+wx, py: y*TILE_SIZE+wy, bright: rng() > 0.5 });
+          if (rng() < 0.45) {
+            const tier = rng();
+            windows.push({
+              px: x*TILE_SIZE+wx, py: y*TILE_SIZE+wy,
+              bright: tier > 0.4,
+              flicker: tier < 0.2,
+              phase: rng() * Math.PI * 2,
+            });
           }
         }
       }
@@ -232,15 +238,36 @@ function generateMap() {
   // ── Neon signs ───────────────────────────────────────────────────────────
   neonSigns = [];
   const rng2 = mulberry32(99);
-  const cnt  = 2 + Math.floor(rng2() * 2);
+  const NAMED_SIGNS = [
+    { label: 'VELVET LOUNGE',          color: '#ff00cc' },
+    { label: 'EXECUTIVE SUITES',       color: '#00ffee' },
+    { label: 'CLUB RENDEZVOUS',        color: '#ff44aa' },
+    { label: 'NOCTURNAL TRANSIT',      color: '#ff6600' },
+    { label: 'DISCREET SERVICES',      color: '#aa00ff' },
+    { label: 'AFTER DARK',             color: '#ff0033' },
+    { label: 'THE BACK NINE',          color: '#00ff66' },
+    { label: 'PREMIUM ACCOMMODATIONS', color: '#00eeff' },
+    { label: 'VACANCY',                color: '#ff2200' },
+    { label: 'ROOMS',                  color: '#ffee00' },
+    { label: 'TRENCHCOAT TAILORS',     color: '#9933ff' },
+    { label: '★ OPEN ★',              color: '#ff00aa' },
+    { label: '◈ LOUNGE ◈',            color: '#00ffaa' },
+    { label: '24HR',                   color: '#ffcc00' },
+    { label: 'LIVE MUSIC',             color: '#ff3388' },
+  ];
+  const cnt = 12 + Math.floor(rng2() * 7); // 12-18 signs
   for (let i = 0; i < cnt; i++) {
-    let tx, ty;
-    do { tx = Math.floor(rng2() * CITY_TILES); ty = Math.floor(rng2() * CITY_TILES); }
-    while (map[ty][tx] !== TILE.BUILDING);
+    let tx, ty, tries = 0;
+    do { tx = Math.floor(rng2() * CITY_TILES); ty = Math.floor(rng2() * CITY_TILES); tries++; }
+    while (map[ty][tx] !== TILE.BUILDING && tries < 300);
+    const def = NAMED_SIGNS[i % NAMED_SIGNS.length];
     neonSigns.push({
-      px: tx*TILE_SIZE+2, py: ty*TILE_SIZE+2,
-      w: TILE_SIZE-4, h: TILE_SIZE-4,
-      color: NEON_COLORS[Math.floor(rng2() * NEON_COLORS.length)],
+      px: tx*TILE_SIZE + 1,
+      py: ty*TILE_SIZE + 3,
+      w: TILE_SIZE - 2,
+      h: 12,
+      color: def.color,
+      label: def.label,
     });
   }
 }
@@ -789,6 +816,20 @@ function drawMap(ox, oy) {
     }
   }
 
+  // Streetlight pools at intersections
+  for (let ty = startTY; ty <= endTY; ty++) {
+    for (let tx = startTX; tx <= endTX; tx++) {
+      if (!isRoadCol(tx) || !isRoadRow(ty)) continue;
+      const sx = tx * TILE_SIZE + TILE_SIZE / 2 - ox;
+      const sy = ty * TILE_SIZE + TILE_SIZE / 2 - oy;
+      const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, 40);
+      grad.addColorStop(0,   'rgba(255,240,180,0.06)');
+      grad.addColorStop(1,   'rgba(255,240,180,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(sx - 40, sy - 40, 80, 80);
+    }
+  }
+
   // Road dashes (also on HIDDEN_PARK for visual continuity)
   ctx.strokeStyle = COLOR.ROAD_MARK;
   ctx.lineWidth   = 1;
@@ -818,19 +859,57 @@ function drawMap(ox, oy) {
 function drawWindows(ox, oy) {
   for (const w of windows) {
     if (w.px < ox || w.px > ox+CANVAS_W || w.py < oy || w.py > oy+CANVAS_H) continue;
+    let alpha = 1;
+    if (w.flicker) {
+      alpha = 0.6 + 0.4 * Math.sin(pulse * 2.3 + w.phase);
+    }
+    ctx.globalAlpha = alpha;
     ctx.fillStyle = w.bright ? '#ffffcc' : '#ffee88';
     ctx.fillRect(w.px-ox, w.py-oy, 2, 2);
   }
+  ctx.globalAlpha = 1;
 }
 
 function drawNeonSigns(ox, oy) {
   for (const n of neonSigns) {
-    const sx = n.px-ox, sy = n.py-oy;
-    if (sx+n.w < 0 || sx > CANVAS_W || sy+n.h < 0 || sy > CANVAS_H) continue;
+    const sx = n.px - ox, sy = n.py - oy;
+    if (sx + n.w < 0 || sx > CANVAS_W || sy + n.h < 0 || sy > CANVAS_H) continue;
+
     ctx.save();
-    ctx.shadowColor = n.color; ctx.shadowBlur = 12;
-    ctx.fillStyle   = n.color + '55'; ctx.fillRect(sx, sy, n.w, n.h);
-    ctx.strokeStyle = n.color; ctx.lineWidth = 2; ctx.strokeRect(sx, sy, n.w, n.h);
+
+    // Chromatic aberration: red glow shifted +1px right, blue glow -1px left
+    ctx.globalAlpha = 0.3;
+    ctx.shadowBlur  = 10;
+    ctx.shadowColor = '#ff0000';
+    ctx.strokeStyle = '#ff0000';
+    ctx.lineWidth   = 1.5;
+    ctx.strokeRect(sx + 1, sy, n.w, n.h);
+    ctx.shadowColor = '#0000ff';
+    ctx.strokeStyle = '#0000ff';
+    ctx.strokeRect(sx - 1, sy, n.w, n.h);
+    ctx.globalAlpha = 1;
+
+    // Main glow and fill
+    ctx.shadowColor = n.color;
+    ctx.shadowBlur  = 14;
+    ctx.fillStyle   = n.color + '44';
+    ctx.fillRect(sx, sy, n.w, n.h);
+    ctx.strokeStyle = n.color;
+    ctx.lineWidth   = 1.5;
+    ctx.strokeRect(sx, sy, n.w, n.h);
+
+    // Label text
+    if (n.label) {
+      ctx.shadowBlur   = 6;
+      ctx.shadowColor  = n.color;
+      ctx.fillStyle    = n.color;
+      ctx.font         = '8px monospace';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(n.label, sx + n.w / 2, sy + n.h / 2);
+      ctx.textBaseline = 'alphabetic';
+    }
+
     ctx.restore();
   }
 }
@@ -1099,6 +1178,25 @@ function render() {
     ctx.lineWidth   = 16;
     ctx.strokeRect(0, 0, CANVAS_W, CANVAS_H);
     ctx.restore();
+  }
+
+  // ── CRT Scanlines ─────────────────────────────────────────────────────────
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  for (let y = 0; y < CANVAS_H; y += 2) {
+    ctx.fillRect(0, y, CANVAS_W, 1);
+  }
+  ctx.restore();
+
+  // ── Vignette ──────────────────────────────────────────────────────────────
+  {
+    const cx = CANVAS_W / 2, cy = CANVAS_H / 2;
+    const r  = Math.max(CANVAS_W, CANVAS_H) * 0.75;
+    const vg = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
   }
 
   drawHUD();
